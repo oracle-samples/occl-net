@@ -13,6 +13,8 @@ limitations under the License.
 
 # Contributing to OCCL-net
 
+This repository tracks NVIDIA NCCL baseline with OCCL-net modifications.
+
 ## Commit Requirements
 
 - Use DCO sign-off for all commits: `git commit -s`
