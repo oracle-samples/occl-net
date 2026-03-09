@@ -1,0 +1,59 @@
+# Invalidate cache to prevent ARM64/AMD64 layer collisions
+ARG TARGET_ARCH_CACHE
+
+# Set the base operating system and CUDA toolkit version
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
+
+# Prevent interactive prompts during apt installations
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build tools, language servers, and base networking dependencies
+# Includes PPAs for latest Git (>= 2.35) and Kitware repository for latest CMake
+RUN apt-get update && apt-get install -y software-properties-common \
+    && add-apt-repository ppa:git-core/ppa -y \
+    && apt-get update && apt-get install -y \
+    gpg \
+    wget \
+    && wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg \
+    && echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ jammy main' | tee /etc/apt/sources.list.d/kitware.list >/dev/null \
+    && apt-get update && apt-get install -y \
+    cmake \
+    build-essential \
+    ninja-build \
+    ccache \
+    openmpi-bin \
+    libopenmpi-dev \
+    libibverbs-dev \
+    librdmacm-dev \
+    gdb \
+    gdb-multiarch \
+    clangd \
+    clang-format \
+    clang-tidy \
+    cppcheck \
+    shellcheck \
+    git \
+    rsync \
+    openssh-client \
+    pkg-config \
+    libnl-3-dev \
+    libnl-route-3-dev \
+    udev \
+    python3 \
+    cython3 \
+    python3-docutils \
+    pandoc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build rdma-core from source to get the latest Mellanox Data Direct headers
+WORKDIR /tmp
+RUN git clone --branch v62.0 https://github.com/linux-rdma/rdma-core.git \
+    && cd rdma-core \
+    && cmake -DNO_PYVERBS=1 -DENABLE_STATIC=1 -B build -S . \
+    && cmake --build build --target install \
+    && ldconfig \
+    && cd / \
+    && rm -rf /tmp/rdma-core
+
+# Set the working directory to match the Dev Container mount point
+WORKDIR /workspace

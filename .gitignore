@@ -2,3 +2,7 @@
 /build
 *.gcov
 /coverage/
+.idea/
+.oca/
+cmake-build-*
+.env.local

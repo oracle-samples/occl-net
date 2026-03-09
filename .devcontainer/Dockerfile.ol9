@@ -1,0 +1,54 @@
+# Invalidate cache to prevent ARM64/AMD64 layer collisions
+ARG TARGET_ARCH_CACHE
+
+# Set the base operating system and CUDA toolkit version
+FROM nvidia/cuda:13.1.1-cudnn-devel-oraclelinux9
+
+# Install build tools, language servers, and base networking dependencies
+# Includes EPEL and CodeReady Builder (CRB) for developer packages
+RUN dnf install -y oracle-epel-release-el9 \
+    && dnf config-manager --set-enabled ol9_codeready_builder \
+    && dnf update -y \
+    && dnf install -y \
+    gcc \
+    gcc-c++ \
+    make \
+    ninja-build \
+    ccache \
+    openmpi \
+    openmpi-devel \
+    gdb \
+    clang-tools-extra \
+    cppcheck \
+    ShellCheck \
+    git \
+    rsync \
+    openssh-clients \
+    pkgconf \
+    libnl3-devel \
+    systemd-devel \
+    python3 \
+    python3-pip \
+    && dnf clean all
+
+# Upgrade CMake via pip to ensure version >= 3.24 for multi-arch compatibility
+RUN pip3 install cmake --upgrade
+
+# Inject OpenMPI paths directly to support Enterprise Linux environment modules
+# Includes both x86_64 (lib64) and aarch64 (lib) paths
+ENV PATH="/usr/lib64/openmpi/bin:/usr/lib/openmpi/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/usr/lib64/openmpi/lib:/usr/lib/openmpi/lib:${LD_LIBRARY_PATH}"
+ENV MPI_HOME="/usr/lib64/openmpi"
+
+# Build rdma-core from source to get the latest Mellanox Data Direct headers
+WORKDIR /tmp
+RUN git clone --branch v62.0 https://github.com/linux-rdma/rdma-core.git \
+    && cd rdma-core \
+    && cmake -DNO_PYVERBS=1 -DNO_MAN_PAGES=1 -DENABLE_STATIC=1 -B build -S . \
+    && cmake --build build --target install \
+    && ldconfig \
+    && cd / \
+    && rm -rf /tmp/rdma-core
+
+# Set the working directory to match the Dev Container mount point
+WORKDIR /workspace

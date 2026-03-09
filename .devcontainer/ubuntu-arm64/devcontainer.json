@@ -1,0 +1,68 @@
+{
+    "name": "OCCL Net Plugin - Ubuntu (ARM64)",
+    "build": {
+        // Use common Ubuntu Dockerfile; this variant targets ARM64.
+        "dockerfile": "../Dockerfile.ubuntu",
+        "options": [
+            // Build for ARM64 even on multi-arch hosts.
+            "--platform=linux/arm64",
+            // Always pull latest base image.
+            "--pull=true"
+        ],
+        "args": {
+            // Arch-specific cache/toolchain selector.
+            "TARGET_ARCH_CACHE": "arm64"
+        }
+    },
+    "mounts": [
+        // Shared compiler cache across container rebuilds.
+        "source=occl-net-ccache-vol,target=/root/.cache/ccache,type=volume",
+        // Reuse host SSH keys (read-only) for repo access.
+        "source=${localEnv:HOME}/.ssh,target=/root/.ssh,type=bind,readonly"
+    ],
+    "containerEnv": {
+        // Location of MPI installation inside the container.
+        "MPI_HOME": "/usr/lib/aarch64-linux-gnu/openmpi"
+    },
+    // Avoid git “dubious ownership” warnings in mapped workspaces.
+    "postCreateCommand": "git config --global --add safe.directory '*'",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                // Core C/C++ and tooling extensions for this repo.
+                "llvm-vs-code-extensions.vscode-clangd",
+                "ms-vscode.cpptools",
+                "ms-vscode.cmake-tools",
+                "timonwong.shellcheck",
+                "xaver.clang-format",
+                "${containerWorkspaceFolder}/.vscode/extensions/octo-0.0.25.vsix"
+            ],
+            "settings": {
+                // Prefer clangd over MS C/C++ IntelliSense.
+                "C_Cpp.intelliSenseEngine": "disabled",
+                "clangd.arguments": [
+                    "--background-index",
+                    "--compile-commands-dir=${workspaceFolder}/build",
+                    "--clang-tidy",
+                    "--header-insertion=iwyu",
+                    "--completion-style=detailed"
+                ],
+                "editor.formatOnSave": true,
+                "[c]": {
+                    // Use clangd as formatter for C files.
+                    "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+                },
+                // Use Ninja for faster CMake builds.
+                "cmake.generator": "Ninja",
+                "cmake.configureOnOpen": true,
+                "cmake.configureArgs": [
+                    // Use ccache to speed up (re)builds.
+                    "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
+                    "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+                ]
+            }
+        }
+    },
+    // Run as root to simplify package installation.
+    "remoteUser": "root"
+}
