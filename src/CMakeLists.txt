@@ -257,6 +257,69 @@ set_target_properties(nccl_static PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
 )
 
+###################### Create external plugin from built-in IB transport ############################
+option(BUILD_IB_TRANSPORT_PLUGIN "Build an external net plugin from transport/net_ib implementation" ON)
+
+if(BUILD_IB_TRANSPORT_PLUGIN)
+  set(IB_TRANSPORT_PLUGIN_SOURCES
+      ${CMAKE_CURRENT_SOURCE_DIR}/plugin/net/net_ib_plugin_v11.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/plugin/net/net_ib_plugin_stubs.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/common.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/connect.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/gdr.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/init.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/p2p.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/p2p_resiliency.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/reg.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/misc/socket.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/misc/ibvwrap.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/misc/ibvsymbols.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/misc/mlx5dvwrap.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/misc/mlx5dvsymbols.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/misc/cudawrap.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/misc/param.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/misc/utils.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/misc/nvmlwrap.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/misc/gdrwrap.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/debug.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/os/linux.cc
+  )
+
+  add_library(occl-net-ib-plugin SHARED
+      ${IB_TRANSPORT_PLUGIN_SOURCES}
+  )
+
+  target_include_directories(occl-net-ib-plugin
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/include/plugin
+      ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib
+      ${CMAKE_BINARY_DIR}/include
+      ${CMAKE_BINARY_DIR}/obj/include
+  )
+
+  # Build as standalone plugin without linking nccl_static to avoid pulling
+  # the full device kernel build graph.
+  target_link_libraries(occl-net-ib-plugin
+    PUBLIC
+      Threads::Threads
+      ${CMAKE_DL_LIBS}
+      CUDA::cudart
+      ${EXTRA_LIBS}
+  )
+  target_link_options(occl-net-ib-plugin PRIVATE "-Wl,--no-undefined")
+
+  add_dependencies(occl-net-ib-plugin nccl_header generate_git_version)
+
+  set_target_properties(occl-net-ib-plugin PROPERTIES
+      OUTPUT_NAME "occl-net-ib"
+      PREFIX "lib"
+      POSITION_INDEPENDENT_CODE ON
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  )
+endif()
+
 ###################### Install targets / headers / pkg-config ############################
 install(TARGETS nccl nccl_static
   EXPORT NCCLTargets
@@ -264,6 +327,14 @@ install(TARGETS nccl nccl_static
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
 )
+
+if(BUILD_IB_TRANSPORT_PLUGIN)
+  install(TARGETS occl-net-ib-plugin
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+  )
+endif()
 
 # Install tools, but do not export them as linkable imported targets.
 install(TARGETS ncclras
