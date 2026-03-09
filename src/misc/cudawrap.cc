@@ -156,11 +156,13 @@ DECLARE_CUDA_PFN(cuMulticastGetGranularity, 12010);
 DECLARE_CUDA_PFN(cuMulticastUnbind, 12010);
 #endif
 /* Stream MemOp support */
+#if defined(PFN_cuStreamBatchMemOp_v11070)
 DECLARE_CUDA_PFN(cuStreamBatchMemOp, 11070);
 DECLARE_CUDA_PFN(cuStreamWaitValue32, 11070);
 DECLARE_CUDA_PFN(cuStreamWaitValue64, 11070);
 DECLARE_CUDA_PFN(cuStreamWriteValue32, 11070);
 DECLARE_CUDA_PFN(cuStreamWriteValue64, 11070);
+#endif
 #endif
 
 #define CUDA_DRIVER_MIN_VERSION 11030
@@ -247,11 +249,13 @@ static ncclResult_t cudaPfnFuncLoader(void) {
   LOAD_SYM(cuMulticastUnbind, 12010, 1);
 #endif
 /* Stream MemOp support */
+#if defined(PFN_cuStreamBatchMemOp_v11070)
   LOAD_SYM(cuStreamBatchMemOp, 11070, 1);
   LOAD_SYM(cuStreamWaitValue32, 11070, 1);
   LOAD_SYM(cuStreamWaitValue64, 11070, 1);
   LOAD_SYM(cuStreamWriteValue32, 11070, 1);
   LOAD_SYM(cuStreamWriteValue64, 11070, 1);
+#endif
   return ncclSuccess;
 }
 #endif
@@ -315,6 +319,7 @@ ncclResult_t ncclCudaLibraryInit() {
 
 // Wrapper for cuStreamBatchMemOp that handles the 255 operations per call limit
 ncclResult_t ncclCuStreamBatchMemOp(cudaStream_t stream, unsigned int numOps, CUstreamBatchMemOpParams* batchParams) {
+#if CUDART_VERSION >= 11030 && defined(PFN_cuStreamBatchMemOp_v11070)
   ncclResult_t ret = ncclSuccess;
   const unsigned int maxOpsPerBatch = 255;
 
@@ -327,4 +332,10 @@ exit:
   return ret;
 fail:
   goto exit;
+#else
+  (void)stream;
+  (void)numOps;
+  (void)batchParams;
+  return ncclInternalError;
+#endif
 }
