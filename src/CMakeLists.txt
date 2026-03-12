@@ -259,8 +259,53 @@ set_target_properties(nccl_static PROPERTIES
 
 ###################### Create external plugin from built-in IB transport ############################
 option(BUILD_IB_TRANSPORT_PLUGIN "Build an external net plugin from transport/net_ib implementation" ON)
+option(OCCL_PLUGIN_STATIC_CUDART "Link the standalone IB transport plugin against the static CUDA runtime when available to avoid a hard libcudart.so major-version dependency" ON)
+option(OCCL_PLUGIN_STATIC_CXX_RUNTIME "Link the standalone IB transport plugin against static libstdc++ when supported while keeping libgcc shared to avoid host libstdc++.so.6 ABI mismatches without raising the glibc baseline unnecessarily" ON)
 
 if(BUILD_IB_TRANSPORT_PLUGIN)
+  include(CMakePushCheckState)
+  include(CheckCXXSourceCompiles)
+  set(occl_plugin_cuda_runtime_target CUDA::cudart)
+  set(occl_plugin_cxx_runtime_linkage "dynamic")
+  set(occl_plugin_cxx_runtime_link_options "")
+  if(OCCL_PLUGIN_STATIC_CUDART)
+    if(TARGET CUDA::cudart_static)
+      set(occl_plugin_cuda_runtime_target CUDA::cudart_static)
+    else()
+      message(WARNING "OCCL_PLUGIN_STATIC_CUDART=ON but CUDA::cudart_static is unavailable; falling back to CUDA::cudart for occl-net-ib-plugin")
+    endif()
+  endif()
+  if(OCCL_PLUGIN_STATIC_CXX_RUNTIME)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+      unset(OCCL_PLUGIN_CAN_STATIC_LINK_CXX_RUNTIME CACHE)
+      unset(OCCL_PLUGIN_CAN_STATIC_LINK_CXX_RUNTIME)
+      cmake_push_check_state(RESET)
+      list(APPEND CMAKE_REQUIRED_LINK_OPTIONS
+        "-static-libstdc++"
+      )
+      check_cxx_source_compiles("
+        #include <string>
+        int main() {
+          std::string s = \"occl\";
+          return s.size() == 4 ? 0 : 1;
+        }
+      " OCCL_PLUGIN_CAN_STATIC_LINK_CXX_RUNTIME)
+      cmake_pop_check_state()
+      if(OCCL_PLUGIN_CAN_STATIC_LINK_CXX_RUNTIME)
+        set(occl_plugin_cxx_runtime_linkage "static-libstdc++/shared-libgcc")
+        list(APPEND occl_plugin_cxx_runtime_link_options
+          "-static-libstdc++"
+        )
+      else()
+        message(WARNING "OCCL_PLUGIN_STATIC_CXX_RUNTIME=ON but the current toolchain cannot link a trivial C++ program with -static-libstdc++ (for example, libstdc++-static may be missing); using dynamic C++ runtime for occl-net-ib-plugin")
+      endif()
+    else()
+      message(WARNING "OCCL_PLUGIN_STATIC_CXX_RUNTIME=ON but compiler ${CMAKE_CXX_COMPILER_ID} does not support -static-libstdc++ flags; using dynamic C++ runtime for occl-net-ib-plugin")
+    endif()
+  endif()
+  message(STATUS "occl-net-ib-plugin CUDA runtime linkage: ${occl_plugin_cuda_runtime_target}")
+  message(STATUS "occl-net-ib-plugin C++ runtime linkage: ${occl_plugin_cxx_runtime_linkage}")
+
   set(IB_TRANSPORT_PLUGIN_SOURCES
       ${CMAKE_CURRENT_SOURCE_DIR}/plugin/net/net_ib_plugin_v11.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/plugin/net/net_ib_plugin_stubs.cc
@@ -302,13 +347,16 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
   # Build as standalone plugin without linking nccl_static to avoid pulling
   # the full device kernel build graph.
   target_link_libraries(occl-net-ib-plugin
-    PUBLIC
+    PRIVATE
       Threads::Threads
       ${CMAKE_DL_LIBS}
-      CUDA::cudart
+      ${occl_plugin_cuda_runtime_target}
       ${EXTRA_LIBS}
   )
-  target_link_options(occl-net-ib-plugin PRIVATE "-Wl,--no-undefined")
+  target_link_options(occl-net-ib-plugin PRIVATE
+    "-Wl,--no-undefined"
+    ${occl_plugin_cxx_runtime_link_options}
+  )
 
   add_dependencies(occl-net-ib-plugin nccl_header generate_git_version)
 

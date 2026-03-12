@@ -8,6 +8,7 @@
 #ifndef NET_IB_CONNECT_H_
 #define NET_IB_CONNECT_H_
 
+
 #include "common.h"
 #include "ibvwrap.h"
 
@@ -38,6 +39,9 @@ struct ncclIbQpInfo {
 struct ncclIbResiliencyInfo {
   // QPs used for probing of data transfers in case of QP/device failures.
   struct ncclIbQpInfo probingQpsInfo[NCCL_IB_MAX_DEVS_PER_NIC];
+  // Exposed peer-ready bitmap used for QP rejoin synchronization.
+  uint64_t readyQpMaskAddr;
+  uint32_t readyQpMaskRkeys[NCCL_IB_MAX_DEVS_PER_NIC];
 };
 
 // Structure used to hold information needed to establish the communication
@@ -64,6 +68,7 @@ struct ncclIbConnectionMetadata {
   int sl;
 };
 
+ncclResult_t ibQpToInit(struct ncclIbQp* qp);
 ncclResult_t ncclIbCreateQp(struct ncclIbQpCreateAttr* createQpAttrs, void* qp_context, struct ncclIbQp* qp);
 ncclResult_t ncclIbRtrQp(struct ibv_qp* qp, struct ncclIbGidInfo* sGidInfo, uint32_t dest_qp_num, struct ncclIbDevInfo* info, bool fifoTc, int tc, int sl);
 ncclResult_t ncclIbRtsQp(struct ibv_qp* qp);

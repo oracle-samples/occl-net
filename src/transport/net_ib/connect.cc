@@ -315,6 +315,18 @@ ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, str
   return ncclSuccess;
 }
 
+
+ncclResult_t ibQpToInit(struct ncclIbQp* qp) {
+  struct ibv_qp_attr qpAttr;
+  memset(&qpAttr, 0, sizeof(struct ibv_qp_attr));
+  qpAttr.qp_state = IBV_QPS_INIT;
+  qpAttr.pkey_index = ncclParamIbPkey();
+  qpAttr.port_num = qp->ibPort;
+  qpAttr.qp_access_flags = qp->accessFlags;
+  NCCLCHECK(wrap_ibv_modify_qp(qp->qp, &qpAttr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS));
+  return ncclSuccess;
+}
+
 ncclResult_t ncclIbCreateQp(struct ncclIbQpCreateAttr* createQpAttrs, void* qp_context, struct ncclIbQp* qp) {
   struct ibv_qp_init_attr qpInitAttr;
   memset(&qpInitAttr, 0, sizeof(struct ibv_qp_init_attr));
@@ -328,13 +340,11 @@ ncclResult_t ncclIbCreateQp(struct ncclIbQpCreateAttr* createQpAttrs, void* qp_c
   qpInitAttr.cap.max_recv_sge = 1;
   qpInitAttr.cap.max_inline_data = ncclParamIbUseInline() ? sizeof(struct ncclIbSendFifo) : 0;
   NCCLCHECK(wrap_ibv_create_qp(&qp->qp, createQpAttrs->pd, &qpInitAttr));
-  struct ibv_qp_attr qpAttr;
-  memset(&qpAttr, 0, sizeof(struct ibv_qp_attr));
-  qpAttr.qp_state = IBV_QPS_INIT;
-  qpAttr.pkey_index = ncclParamIbPkey();
-  qpAttr.port_num = createQpAttrs->ibPort;
-  qpAttr.qp_access_flags = createQpAttrs->accessFlags;
-  NCCLCHECK(wrap_ibv_modify_qp(qp->qp, &qpAttr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS));
+  qp->ibPort = createQpAttrs->ibPort;
+  qp->accessFlags = createQpAttrs->accessFlags;
+  memset(&qp->remEce, 0, sizeof(qp->remEce));
+  qp->remEceSupported = 0;
+  NCCLCHECK(ibQpToInit(qp));
   return ncclSuccess;
 }
 
@@ -500,6 +510,13 @@ static ncclResult_t ncclIbSenderQpsToRts(ncclIbSendComm* comm, struct ncclIbConn
     ncclIbDevInfo* remDevInfo = &remMeta->devs[remQpInfo->devIndex];
 
     localQp->remDevIdx = remQpInfo->devIndex;
+    localQp->remQpn = remQpInfo->qpn;
+    localQp->remEceSupported = remQpInfo->ece_supported;
+    if (remQpInfo->ece_supported) {
+      localQp->remEce = remQpInfo->ece;
+    } else {
+      memset(&localQp->remEce, 0, sizeof(localQp->remEce));
+    }
 
     if (remQpInfo->ece_supported) {
       // Set the reduced ECE received from the receiver side
@@ -680,6 +697,8 @@ ib_recv_dev_list:
   meta.addr = (uint64_t)comm->ctsFifo;
   meta.sl = (ncclParamIbSl() != -1) ? ncclParamIbSl() : (config && config->trafficClass != NCCL_NET_TRAFFIC_CLASS_UNDEF) ? config->trafficClass : NCCL_IB_SL_DEFAULT;
   meta.tc = (ncclParamIbTc() != -1) ? ncclParamIbTc() : (config && config->trafficClass != NCCL_NET_TRAFFIC_CLASS_UNDEF) ? config->trafficClass : NCCL_IB_TC_DEFAULT;
+  comm->base.connSl = meta.sl;
+  comm->base.connTc = meta.tc;
   strncpy(meta.devName, mergedDev->devName, MAX_MERGED_DEV_NAME);
 
   stage->state = ncclIbCommStateSend;
@@ -839,7 +858,14 @@ static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
     ncclIbQp* localQp = &rComm->base.qps[qpIndex];
 
     localQp->remDevIdx = remDevIndex;
+    localQp->remQpn = remQpInfo->qpn;
     localQp->devIndex = devIndex;
+    localQp->remEceSupported = remQpInfo->ece_supported;
+    if (remQpInfo->ece_supported) {
+      localQp->remEce = remQpInfo->ece;
+    } else {
+      memset(&localQp->remEce, 0, sizeof(localQp->remEce));
+    }
 
     qpCreateAttrs.ibPort = ibDev->portNum;
     qpCreateAttrs.cq = rCommDev->base.cq;
@@ -1148,6 +1174,8 @@ ib_recv:
   meta.addr = (uint64_t)rComm->cmplsRecords;
   meta.sl = remMeta.sl;
   meta.tc = remMeta.tc;
+  rComm->base.connSl = meta.sl;
+  rComm->base.connTc = meta.tc;
 
   meta.ndevs = rComm->base.vProps.ndevs;
   strncpy(meta.devName, mergedDev->devName, MAX_MERGED_DEV_NAME);

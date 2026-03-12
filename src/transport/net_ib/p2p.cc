@@ -15,6 +15,7 @@ enum ncclIbRequestMatchingScheme {
   BY_ID=1,
 };
 
+
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 // By default, use ncclIbRequestMatchingScheme::BY_INDEX matching scheme.
 NCCL_PARAM(IbReceiverSideMatchingScheme, "IB_RECEIVER_SIDE_MATCHING_SCHEME", 0);
@@ -101,6 +102,13 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   TRACE(NCCL_NET, "NET/IB: %s: Posting a send request (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d)", __func__, reqs[0], reqs[0]->base, reqs[0]->id, slot, nreqs);
 
   int nqps = ncclIbCommBaseGetNqpsPerRequest(&comm->base);
+  uint8_t attemptOrder[NCCL_IB_MAX_QPS] = {0};
+  if (comm->base.resiliency) {
+    for (int r = 0; r < nreqs; r++) {
+      memset(reqs[r]->send.lastAttemptQpIndex, 0xff, sizeof(reqs[r]->send.lastAttemptQpIndex));
+      memset(reqs[r]->send.lastAttemptOrder, 0, sizeof(reqs[r]->send.lastAttemptOrder));
+    }
+  }
   uint64_t wr_id = 0ULL;
   for (int r=0; r<nreqs; r++) {
     struct ibv_send_wr* wr = comm->wrs+r;
@@ -162,19 +170,21 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   for (int i = 0; i < nqps; i++) {
     NCCLCHECK(ncclIbCommBaseGetQpForRequest(&comm->base, reqs[0]->id, i, &qp, &qpIndex));
 
-    TRACE(NCCL_NET, "NET/IB: %s: Posting send (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d, wr_id=%ld) on QP (qp_num=%u, devIndex=%d, qpIndex=%d)", __func__, reqs[0], reqs[0]->base, reqs[0]->id, slot, nreqs, wr_id, qp->qp->qp_num, qp->devIndex, qpIndex);
+    TRACE(NCCL_NET, "NET/IB: %s: Posting send (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d, wr_id=%ld) on QP (qp_num=%u, devIndex=%d, logicalQpIndex=%d)", __func__, reqs[0], reqs[0]->base, reqs[0]->id, slot, nreqs, wr_id, qp->qp->qp_num, qp->devIndex, qpIndex);
 
-    // Selective retransmission
-    if (comm->base.resiliency && reqs[0]->send.sentData[qpIndex] == true) {
+    // Skip logical chunks that were already credited by the probing path.
+    if (comm->base.resiliency && reqs[0]->send.pendingData[qpIndex] == false) {
       for (int r=0; r<nreqs; r++) {
         comm->wrs[r].sg_list->addr += comm->wrs[r].sg_list->length;
         comm->wrs[r].wr.rdma.remote_addr += comm->wrs[r].sg_list->length;
       }
-      INFO(NCCL_NET, "NET/IB: %s: Skipping retransmission on QP index %d (req=%p, slot=%d) as it was already delivered.", __func__, qpIndex, reqs[0], slot);
+      INFO(NCCL_NET, "NET/IB: %s: Skipping logical QP index %d (req=%p, slot=%d) as it was already delivered.", __func__, qpIndex, reqs[0], slot);
       continue;
     }
 
     int devIndex = qp->devIndex;
+    int physicalQpIndex = qp - comm->base.qps;
+    assert(physicalQpIndex >= 0 && physicalQpIndex < comm->base.nqps);
     for (int r=0; r<nreqs; r++) {
       // Track this event for completion
       //ncclIbAddEvent(reqs[r], devIndex);
@@ -239,6 +249,11 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
     }
 #endif // ENABLE_TRACE
     NCCLCHECK(wrap_ibv_post_send(qp->qp, comm->wrs, &bad_wr));
+    for (int r = 0; r < nreqs; r++) {
+      reqs[r]->send.lastAttemptQpIndex[qpIndex] = physicalQpIndex;
+      reqs[r]->send.lastAttemptOrder[qpIndex] = attemptOrder[physicalQpIndex];
+    }
+    attemptOrder[physicalQpIndex]++;
 
     // Update the send offset and addresses for the next QP according to the
     // actual data size that was sent on the current QP, for every request
@@ -246,8 +261,8 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       sendOffsets[r] = std::min<uint32_t>(sendOffsets[r] + comm->wrs[r].sg_list->length, reqs[r]->send.size);
       comm->wrs[r].sg_list->addr += comm->wrs[r].sg_list->length;
       comm->wrs[r].wr.rdma.remote_addr += comm->wrs[r].sg_list->length;
-      TRACE(NCCL_NET, "NET/IB: %s: Send request (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d, reqIdx=%d, wr_id=%ld) posted %d bytes on QP index %d (devIndex=%d, qp_num=%u), total posted %d/%d bytes", __func__, reqs[r], reqs[0]->base, reqs[r]->id, slot, nreqs, r, comm->wrs[r].wr_id, comm->wrs[r].sg_list->length, qpIndex, devIndex, qp->qp->qp_num, sendOffsets[r], reqs[r]->send.size);
-      reqs[r]->send.sentData[qpIndex] = true;
+      TRACE(NCCL_NET, "NET/IB: %s: Send request (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d, reqIdx=%d, wr_id=%ld) posted %d bytes on logical QP index %d via physical QP index %d (devIndex=%d, qp_num=%u), total posted %d/%d bytes", __func__, reqs[r], reqs[0]->base, reqs[r]->id, slot, nreqs, r, comm->wrs[r].wr_id, comm->wrs[r].sg_list->length, qpIndex, physicalQpIndex, devIndex, qp->qp->qp_num, sendOffsets[r], reqs[r]->send.size);
+      reqs[r]->send.pendingData[qpIndex] = true;
     }
   }
 
@@ -304,7 +319,10 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
     req->send.size = size;
     req->send.data = data;
     if (comm->base.resiliency) {
-      memset(req->send.sentData, 0, sizeof(req->send.sentData));
+      memset(req->send.pendingData, 0, sizeof(req->send.pendingData));
+      memset(req->send.lastAttemptQpIndex, 0xff, sizeof(req->send.lastAttemptQpIndex));
+      memset(req->send.lastAttemptOrder, 0, sizeof(req->send.lastAttemptOrder));
+      memset(req->send.ackedCompletions, 0, sizeof(req->send.ackedCompletions));
     }
 #ifdef NCCL_ENABLE_NET_PROFILING
     req->pInfo[0].pHandle = phandle;
@@ -317,6 +335,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
     for (int i = 0; i < nqps; i++) {
       NCCLCHECK(ncclIbCommBaseGetQpForRequest(&comm->base, req->id, i, &qp, &qpIndex));
       ncclIbAddEvent(req, qp->devIndex);
+      if (comm->base.resiliency) req->send.pendingData[qpIndex] = true;
     }
 
     // Store all lkeys
@@ -718,7 +737,9 @@ static inline ncclResult_t ncclIbCompletionEventProcess(struct ncclIbNetCommBase
         ncclIbQp* qp = NULL;
         int qpIndex = -1;
         NCCLCHECK(ncclIbCommBaseGetQpByQpNum(commBase, devIndex, wc->qp_num, &qp, &qpIndex));
-        req->recv.cmplsRecords->completions[qpIndex] = 1;
+        if (req->recv.cmplsRecords->completions[qpIndex] != UINT16_MAX) {
+          req->recv.cmplsRecords->completions[qpIndex]++;
+        }
         ncclIbPostRecvWorkRequest(qp->qp, &recvComm->ibRecvWorkRequest);
       }
       req->events[devIndex]--;
@@ -784,6 +805,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
         if (wc->status != IBV_WC_SUCCESS) {
           if (r->base->resiliency == NULL) {
             WARN("NET/IB: %s: Got CQE with error (devIndex=%d, req=%p, comm=%p (%s), wr_id=%lu, qp_num=%d)", __func__, i, r, r->base, r->base->isSend ? "send" : "recv", wc->wr_id, wc->qp_num);
+            WARN("NET/IB: %s: Resiliency is disabled for comm=%p. NET/IB cannot fail over this request; set NCCL_IB_RESILIENCY_PORT_FAILOVER=1 to enable NIC failover before rerunning.", __func__, r->base);
             ncclIbLogCompletionWithError(r->base, wc, i);
             // If resiliency is not enabled, we cannot recover from any error.
             return ncclRemoteError;

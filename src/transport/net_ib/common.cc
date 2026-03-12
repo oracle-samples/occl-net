@@ -43,13 +43,20 @@ struct ncclIbNetCommDevBase* ncclIbGetNetCommDevBase(ncclIbNetCommBase* base, in
 
 ncclResult_t ncclIbBaseCommInit(struct ncclIbNetCommBase* baseComm, bool isSend) {
   for (int i = 0; i < NCCL_IB_MAX_QPS; i++) {
+    baseComm->qps[i].ibPort = 0;
+    baseComm->qps[i].accessFlags = 0;
     baseComm->qps[i].devIndex= -1;
     baseComm->qps[i].remDevIdx= -1;
+    baseComm->qps[i].remQpn = 0;
+    memset(&baseComm->qps[i].remEce, 0, sizeof(baseComm->qps[i].remEce));
+    baseComm->qps[i].remEceSupported = 0;
     baseComm->activeQps[i] = &baseComm->qps[i];
   }
   baseComm->nqps = -1;
   baseComm->splitDataOnQps = ncclParamIbSplitDataOnQps();
   baseComm->nDataQps = -1;
+  baseComm->connTc = 0;
+  baseComm->connSl = 0;
   baseComm->isSend = isSend;
   baseComm->ready = 0;
 

@@ -77,6 +77,23 @@ else()
     message(FATAL_ERROR "Unsupported compiler: ${CMAKE_CXX_COMPILER_ID}")
 endif()
 
+# Reconfigure safely when the build directory was first generated in a
+# different Linux container image and now holds missing absolute library paths.
+set(stale_cache_file_vars
+    CUDAToolkit_rt_LIBRARY
+    RT_LIBRARY
+)
+foreach(stale_cache_file_var IN LISTS stale_cache_file_vars)
+    get_property(stale_cache_file_type CACHE "${stale_cache_file_var}" PROPERTY TYPE)
+    if(stale_cache_file_type)
+        get_property(stale_cache_file_path CACHE "${stale_cache_file_var}" PROPERTY VALUE)
+        if(stale_cache_file_path AND NOT EXISTS "${stale_cache_file_path}")
+            message(STATUS "Clearing stale cache entry ${stale_cache_file_var}=${stale_cache_file_path}")
+            unset(${stale_cache_file_var} CACHE)
+        endif()
+    endif()
+endforeach()
+
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)

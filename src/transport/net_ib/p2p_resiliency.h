@@ -8,6 +8,8 @@
 #ifndef NET_IB_P2P_RESILIENCY_H_
 #define NET_IB_P2P_RESILIENCY_H_
 
+
+
 #include "common.h"
 #include "connect.h"
 
@@ -32,6 +34,33 @@ struct ncclIbResiliencyDev {
   // the receiver side as the memory is only used as a target for RDMA Read
   // operations initiated by the sender side.
   struct ibv_mr* probingResultMr;
+  // MR exposing local ready-QP bitmap to peer via RDMA read.
+  struct ibv_mr* readyQpMaskMr;
+  // MR used as local write target for RDMA-read of peer ready bitmap.
+  struct ibv_mr* peerReadyQpMaskMr;
+  // Temporary backoff window for auxiliary peer-ready reads on this device.
+  uint64_t peerReadyRetryAfterNs;
+  int peerReadyFailureCount;
+};
+
+enum ncclIbResiliencyQpState {
+  // QP is healthy and can be selected for traffic.
+  ncclIbResiliencyQpStateOk = 0,
+  // QP failed and is excluded from active traffic.
+  ncclIbResiliencyQpStateFailed,
+  // QP was rebuilt locally and is waiting for peer-ready confirmation.
+  ncclIbResiliencyQpStateLocalReady,
+  // QP exceeded the local retry budget and will remain on its failover path.
+  ncclIbResiliencyQpStateFailedPermanent,
+};
+
+struct ncclIbResiliencyQpInfo {
+  enum ncclIbResiliencyQpState state;
+  uint64_t lastAttemptNs;
+  // Once a failed QP is observed on a locally inactive port, suppress repeated
+  // retry logs until the port becomes active again.
+  bool localPortRetryLogged;
+  int failCount;
 };
 
 struct ncclIbResiliency {
@@ -60,6 +89,24 @@ struct ncclIbResiliency {
   // Number of requests that are currently being handled by the resiliency
   // module.
   int outstandingRequests;
+
+  // Per-QP rejoin tracking. The implementation intentionally keeps the state
+  // local to each communicator to avoid cross-comm coupling.
+  struct ncclIbResiliencyQpInfo qpInfo[NCCL_IB_MAX_QPS];
+
+  // Local and remote ready-QP bitmaps used for peer-ready synchronization.
+  uint64_t localReadyQpMask[(NCCL_IB_MAX_QPS + 63) / 64];
+  uint64_t remoteReadyQpMask[(NCCL_IB_MAX_QPS + 63) / 64];
+  // Remote memory handle for peer-ready bitmap RDMA reads.
+  uint64_t remoteReadyQpMaskAddr;
+  uint32_t remoteReadyQpMaskRkeys[NCCL_IB_MAX_DEVS_PER_NIC];
+  // Bookkeeping for non-blocking RDMA read of peer-ready bitmap.
+  bool peerReadyReadInFlight;
+  int peerReadyReadQpIndex;
+  int peerReadyReadDevIndex;
+  bool peerReadyReadLogged;
+  int nextPeerReadyQpIndex;
+  uint64_t lastPeerReadyReadNs;
 };
 
 enum ncclIbResiliencyRequestSendState {
@@ -120,13 +167,14 @@ struct ncclIbResiliencySend {
   // At a "steady state" there should be no requests here.
   struct ncclIbResiliencyRequestSend failedRequests[NET_IB_MAX_REQUESTS];
 
-  // Stores the results of probe for this request
+  // Stores the cumulative receiver-side completion counts per physical QP for
+  // this request slot.
   // Note, this memory must be registered with an MR to allow RDMA Read
   // operations to write to it. Although each 1D array in this 2D array
   // "belongs" to a request, a 2D array is allocated to have a contiguous
   // memory allocation, so that the MR registration is easier and can be done
   // *simply* under a single MR (per device).
-  bool probingResults[NET_IB_MAX_REQUESTS][NCCL_IB_MAX_QPS];
+  uint16_t probingResults[NET_IB_MAX_REQUESTS][NCCL_IB_MAX_QPS];
 
   // Stores information, per-device, used to access the completion records
   // structure on the receiver side.
@@ -191,5 +239,9 @@ ncclResult_t ncclIbResiliencyClose(struct ncclIbResiliency* resCtx);
 // side to allow the resiliency context to access the completion records
 // structure on the receiver side.
 ncclResult_t ncclIbResiliencyRemoteCompletionRecordsSet(struct ncclIbResiliency* resCtx, uint32_t cmplsRecordsRkey, uint64_t cmplsRecordsAddr, uint devIndex);
+
+// Rejoin APIs used by progress/error paths to mark and rehabilitate failed QPs.
+ncclResult_t ncclIbResiliencyMarkQpFailed(struct ncclIbResiliency* resCtx, int qpIndex);
+ncclResult_t ncclIbResiliencyTryRejoinQps(struct ncclIbResiliency* resCtx);
 
 #endif // NET_IB_P2P_RESILIENCY_H_

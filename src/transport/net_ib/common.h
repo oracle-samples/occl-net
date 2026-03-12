@@ -11,8 +11,7 @@
 #include "nccl.h"
 #include "core.h"
 #include "socket.h"
-#include "net.h"
-#include "graph.h"
+#include "plugin/nccl_net.h"
 #include "utils.h"
 #include "param.h"
 #include "profiler/net_ib.h"
@@ -43,6 +42,8 @@ struct ncclIbMr {
   int refs;
   ibv_mr *mr;
 };
+
+
 
 struct ncclIbMrCache {
   struct ncclIbMr *slots;
@@ -166,14 +167,12 @@ struct ncclIbRequestCompletionRecord {
   // this array. The receiver reads these sizes before reporting completion of
   // the corresponding receive request to the user.
   int sizes[NCCL_NET_IB_MAX_RECVS];
-  // The receiver fills this array to signal the completion of a data transfer.
-  // The sender can then read this array to see the receiver's status. If the
-  // sender detects an error or device failure, it reads this array to
-  // determine if the receiver considered the transfer complete. This prevents
-  // the sender from retransmitting data if the failure was only visible on the
-  // sender's side. Based on the array's contents, the sender decides if, how,
-  // and on which QPs/devices to replay the transfer.
-  bool completions[NCCL_IB_MAX_QPS];
+  // The receiver fills this array with the number of successfully received data
+  // completions per physical QP. The sender can then reconcile those physical
+  // counts against its logical request-to-QP mapping across failovers/replays
+  // without assuming that logical slot indices still match the physical QP
+  // indices that produced the completions.
+  uint16_t completions[NCCL_IB_MAX_QPS];
 };
 
 struct ncclIbRequest {
@@ -202,8 +201,16 @@ struct ncclIbRequest {
       int size;
       void* data;
       uint32_t lkeys[NCCL_IB_MAX_DEVS_PER_NIC];
-      // Tracks whether data was transmitted on a QP for this request.
-      bool sentData[NCCL_IB_MAX_QPS];
+      // Tracks logical request chunks that still need delivery.
+      bool pendingData[NCCL_IB_MAX_QPS];
+      // Physical QP index used for each logical chunk in the most recent send
+      // attempt. Entries remain -1 for logical chunks that were not attempted.
+      int lastAttemptQpIndex[NCCL_IB_MAX_QPS];
+      // In-order position of the logical chunk within the physical QP stream
+      // for the most recent send attempt.
+      uint8_t lastAttemptOrder[NCCL_IB_MAX_QPS];
+      // Number of receiver completions already credited per physical QP.
+      uint16_t ackedCompletions[NCCL_IB_MAX_QPS];
     } send;
     struct {
       struct ncclIbRequestCompletionRecord* cmplsRecords;
@@ -238,11 +245,20 @@ struct ncclIbSendFifo {
 
 struct ncclIbQp {
   struct ibv_qp* qp;
+  // Cached local QP attributes used to restore INIT state during rejoin.
+  uint8_t ibPort;
+  unsigned int accessFlags;
   // The index of the device on which this QP was created on.
   int devIndex;
   // The index of the device on the remote side to which this QP is connected
   // to.
   int remDevIdx;
+  // Remote QP number paired with this local QP.
+  // This is required to rebuild QP state (RTR/RTS) after failures.
+  uint32_t remQpn;
+  // Cached remote reduced ECE parameters for data-QP rejoin.
+  struct ibv_ece remEce;
+  int remEceSupported;
 };
 
 // We need to support NCCL_NET_MAX_REQUESTS for each concurrent receive
@@ -298,6 +314,10 @@ struct alignas(32) ncclIbNetCommBase {
   // Track necessary remDevInfo here
   int nRemDevs;
   int nDataQps;
+  // Cached traffic-class and service-level used during QP bring-up.
+  // Rejoin logic reuses these values when moving a failed QP back to RTR/RTS.
+  int connTc;
+  int connSl;
   struct ncclIbDevInfo remDevs[NCCL_IB_MAX_DEVS_PER_NIC];
   // statistics about the comm
   struct ncclIbStats stats;
@@ -533,4 +553,3 @@ ncclResult_t ncclIbFinalize(void* ctx);
 ncclResult_t ncclIbSetNetAttr(void *ctx, ncclNetAttr_t *netAttr);
 
 #endif
-
