@@ -10,6 +10,9 @@
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
 NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
+NCCL_PARAM(OciFrmEnable, "OCI_FRM_ENABLE", 0);
+
+double g_inv_cyc_per_us = 0.0;
 
 static std::mutex ncclIbMutex;
 
@@ -397,6 +400,9 @@ ncclResult_t ncclIbInit(void** ctx, uint64_t commId, ncclNetCommConfig_t* config
   NCCLCHECK(ncclCalloc(&netCommConfig, 1));
   netCommConfig->trafficClass = config->trafficClass;
   *ctx = (void *)netCommConfig;
+  (void)gettime();
+  double f = timer_cycles_per_us();
+  g_inv_cyc_per_us = (f > 0.0) ? (1.0 / f) : 0.0;
   return ret;
 }
 

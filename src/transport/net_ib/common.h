@@ -27,6 +27,7 @@
 #include <mutex>
 #define ENABLE_TIMER 0
 #include "timer.h"
+#include "cim.h"
 
 #include "ibvwrap.h"
 #include "mlx5/mlx5dvwrap.h"
@@ -243,7 +244,9 @@ struct ncclIbSendFifo {
   char padding[16];
 };
 
-struct ncclIbQp {
+#define QP_SIG_RING NCCL_NET_IB_MAX_RECVS
+
+struct alignas(128) ncclIbQp {
   struct ibv_qp* qp;
   // Cached local QP attributes used to restore INIT state during rejoin.
   uint8_t ibPort;
@@ -259,7 +262,13 @@ struct ncclIbQp {
   // Cached remote reduced ECE parameters for data-QP rejoin.
   struct ibv_ece remEce;
   int remEceSupported;
+  uint32_t sig_head;
+  uint32_t sig_tail;
+  uint64_t sig_tsc[QP_SIG_RING];
+  uint32_t sig_bytes[QP_SIG_RING];
 };
+static_assert(alignof(struct ncclIbQp) == 128, "ncclIbQp must be 128-byte aligned");
+static_assert((sizeof(struct ncclIbQp) % 128) == 0, "ncclIbQp size must be a 128-byte multiple");
 
 // We need to support NCCL_NET_MAX_REQUESTS for each concurrent receive
 #define NET_IB_MAX_REQUESTS (NCCL_NET_MAX_REQUESTS*NCCL_NET_IB_MAX_RECVS)
@@ -287,6 +296,9 @@ struct alignas(8) ncclIbSendCommDev {
   struct ibv_mr* putSignalScratchpadMr;
   struct ibv_mr* cmplsRecordsMr;
   struct ibv_sge sge;
+  char pciBdf[16];
+  char cardKey[16];
+  int cardKeyValid;
 };
 
 
@@ -295,10 +307,27 @@ struct ncclIbMrHandle {
   ibv_mr* mrs[NCCL_IB_MAX_DEVS_PER_NIC];
 };
 
+#define QP_MAP_BITS 7
+#define QP_MAP_SIZE (1u << QP_MAP_BITS)
+#define QP_MAP_MASK (QP_MAP_SIZE - 1u)
+
+typedef struct {
+  uint32_t keys[QP_MAP_SIZE];
+  uint16_t vals[QP_MAP_SIZE];
+} ncclIbQpNumHash;
+
 // Forward declaration
 struct ncclIbResiliency;
 
-struct alignas(32) ncclIbNetCommBase {
+struct alignas(64) ncclIbNetCommFrmFields {
+  uint64_t qp_lat[NCCL_IB_MAX_QPS];
+  uint64_t qp_raw_lat[NCCL_IB_MAX_QPS];
+  ncclIbQpNumHash qpHash;
+};
+static_assert(alignof(struct ncclIbNetCommFrmFields) == 64, "ncclIbNetCommFrmFields must be 64-byte aligned");
+static_assert((sizeof(struct ncclIbNetCommFrmFields) % 64) == 0, "ncclIbNetCommFrmFields size must be 64-byte multiple");
+
+struct alignas(128) ncclIbNetCommBase {
   ncclNetVDeviceProps_t vProps;
   bool isSend;
   struct ncclIbRequest reqs[NET_IB_MAX_REQUESTS];
@@ -322,7 +351,9 @@ struct alignas(32) ncclIbNetCommBase {
   // statistics about the comm
   struct ncclIbStats stats;
   struct ncclIbResiliency* resiliency;
+  struct ncclIbNetCommFrmFields frmFields;
 };
+static_assert(alignof(struct ncclIbNetCommBase) == 128, "ncclIbNetCommBase must be 128-byte aligned");
 
 struct ncclIbNetCommDevBase* ncclIbGetNetCommDevBase(ncclIbNetCommBase* base, int devIndex);
 
@@ -383,6 +414,16 @@ static inline ncclResult_t ncclIbPostRecvWorkRequest(struct ibv_qp* qp, struct i
   return ncclSuccess;
 }
 
+struct ncclIbMultiSendScratch {
+  void* storage;
+  int nqps;
+  size_t* chunkSizePerReq;
+  ncclIbQp** qpPerPost;
+  struct ibv_send_wr* wrsPerPost;
+  struct ibv_sge* sgesPerPost;
+  size_t* sendSzPerPost;
+};
+
 struct ncclIbSendComm {
   struct ncclIbNetCommBase base;
   // Start with CTS FIFO and ibv structs as they have alignment restrictions
@@ -408,6 +449,9 @@ struct ncclIbSendComm {
   struct ncclIbRemCompletionsRecords remCmplsRecords;
   int ar; // Use adaptive routing when all merged devices have it enabled
   uint64_t putSignalScratchpad;
+  CIMState* cim;
+  struct ncclIbMultiSendScratch multiSendScratch;
+  bool frmGateOpen;
 };
 // The SendFifo needs to be 32-byte aligned and each element needs
 // to be a 32-byte multiple, so that an entry does not get split and
@@ -417,6 +461,22 @@ static_assert((offsetof(struct ncclIbSendComm, ctsFifo) % 32) == 0, "ncclIbSendC
 static_assert((sizeof(struct ncclIbSendFifo) % 32) == 0, "ncclIbSendFifo element size must be 32-byte multiples");
 static_assert((offsetof(struct ncclIbSendComm, sges) % 32) == 0, "sges must be 32-byte aligned");
 static_assert((offsetof(struct ncclIbSendComm, wrs) % 32) == 0, "wrs must be 32-byte aligned");
+
+static inline size_t* ncclIbMultiSendScratchChunkRow(struct ncclIbMultiSendScratch* scratch, int reqIndex) {
+  return scratch->chunkSizePerReq + (size_t)reqIndex * (size_t)scratch->nqps;
+}
+
+static inline struct ibv_send_wr* ncclIbMultiSendScratchWrRow(struct ncclIbMultiSendScratch* scratch, int qpSlot) {
+  return scratch->wrsPerPost + (size_t)qpSlot * (NCCL_NET_IB_MAX_RECVS + 1);
+}
+
+static inline struct ibv_sge* ncclIbMultiSendScratchSgeRow(struct ncclIbMultiSendScratch* scratch, int qpSlot) {
+  return scratch->sgesPerPost + (size_t)qpSlot * NCCL_NET_IB_MAX_RECVS;
+}
+
+static inline size_t* ncclIbMultiSendScratchSendSizeRow(struct ncclIbMultiSendScratch* scratch, int qpSlot) {
+  return scratch->sendSzPerPost + (size_t)qpSlot * NCCL_NET_IB_MAX_RECVS;
+}
 
 struct ncclIbGpuFlush {
   struct ibv_mr* hostMr;
@@ -525,6 +585,8 @@ void ncclIbAddEvent(struct ncclIbRequest* req, int devIndex);
 ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, struct ibv_port_attr* portAttr, int *gidIndex);
 ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbRequest** req);
 ncclResult_t ncclIbFreeRequest(struct ncclIbRequest* r);
+ncclResult_t ncclIbSendCommInitMultiSendScratch(struct ncclIbSendComm* comm);
+void ncclIbSendCommFreeMultiSendScratch(struct ncclIbSendComm* comm);
 
 ncclResult_t ncclIbRegMrDmaBufInternal(void* comm, void* data, size_t size, int type, uint64_t offset, int fd, uint64_t mrFlags, void** mhandle);
 
@@ -551,5 +613,60 @@ ncclResult_t ncclIbMakeVDevice(int* d, ncclNetVDeviceProps_t* props);
 ncclResult_t ncclIbFinalizeDevices(void);
 ncclResult_t ncclIbFinalize(void* ctx);
 ncclResult_t ncclIbSetNetAttr(void *ctx, ncclNetAttr_t *netAttr);
+
+static inline uint32_t qpHash32(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7feb352dU;
+  x ^= x >> 15;
+  x *= 0x846ca68bU;
+  x ^= x >> 16;
+  return x;
+}
+
+static inline void qpMapClear(ncclIbQpNumHash* m) {
+  memset(m->keys, 0, sizeof(m->keys));
+}
+
+static inline void qpMapInsert(ncclIbQpNumHash* m, uint32_t qp_num, uint16_t qpIndex) {
+  if (qp_num == 0) qp_num = 1;
+
+  uint32_t h = qpHash32(qp_num) & QP_MAP_MASK;
+  for (uint32_t probes = 0; probes < QP_MAP_SIZE; probes++) {
+    uint32_t k = m->keys[h];
+    if (k == 0 || k == qp_num) {
+      m->keys[h] = qp_num;
+      m->vals[h] = qpIndex;
+      return;
+    }
+    h = (h + 1) & QP_MAP_MASK;
+  }
+}
+
+static inline int qpMapFind(const ncclIbQpNumHash* m, uint32_t qp_num) {
+  if (qp_num == 0) qp_num = 1;
+
+  uint32_t h = qpHash32(qp_num) & QP_MAP_MASK;
+  for (uint32_t probes = 0; probes < QP_MAP_SIZE; probes++) {
+    uint32_t k = m->keys[h];
+    if (k == 0) return -1;
+    if (k == qp_num) return (int)m->vals[h];
+    h = (h + 1) & QP_MAP_MASK;
+  }
+  return -1;
+}
+
+static inline void qpMapBuild(ncclIbNetCommBase* base) {
+  if (base == NULL) return;
+  qpMapClear(&base->frmFields.qpHash);
+  for (int i = 0; i < base->nqps; i++) {
+    if (base->qps[i].qp == NULL) continue;
+    uint32_t qp_num = base->qps[i].qp->qp_num;
+    qpMapInsert(&base->frmFields.qpHash, qp_num, (uint16_t)i);
+  }
+}
+
+int64_t ncclParamOciFrmEnable();
+int64_t ncclParamOciLatPrintMs();
+extern double g_inv_cyc_per_us;
 
 #endif

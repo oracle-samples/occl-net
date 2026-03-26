@@ -20,6 +20,7 @@ NCCL_PARAM(IbSl, "IB_SL", -1);
 NCCL_PARAM(IbTc, "IB_TC", -1);
 NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", -1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
+NCCL_PARAM(OciLatPrintMs, "OCI_LAT_PRINT_MS", 0);
 
 enum ncclIbCommState {
   ncclIbCommStateStart = 0,
@@ -46,6 +47,16 @@ struct ncclIbHandle {
   uint64_t magic; // random number to help debugging
   struct ncclIbCommStage stage; // Used by the other side when connecting
 };
+
+static inline void ncclIbCopyString(char* dst, size_t dstLen, const char* src) {
+  if (dst == NULL || dstLen == 0) return;
+  if (src == NULL) {
+    dst[0] = '\0';
+    return;
+  }
+  strncpy(dst, src, dstLen - 1);
+  dst[dstLen - 1] = '\0';
+}
 
 NCCL_PARAM(IbQpsPerConn, "IB_QPS_PER_CONNECTION", 1);
 
@@ -120,7 +131,7 @@ static void* envIbAddrRange(sa_family_t af, int* mask) {
   INFO(NCCL_ENV, "NCCL_IB_ADDR_RANGE set by environment to %s", env);
 
   char addrString[128] = { 0 };
-  snprintf(addrString, 128, "%s", env);
+  ncclIbCopyString(addrString, sizeof(addrString), env);
   char *addrStrPtr = addrString;
   char *maskStrPtr = strstr(addrString, "/");
   if (NULL == maskStrPtr) {
@@ -428,6 +439,59 @@ fail:
   goto exit;
 }
 
+static int read_ibdev_pci_bdf(const char* ibdevName, char* outBdf, size_t outLen) {
+  char path[PATH_MAX];
+  char link[PATH_MAX];
+
+  snprintf(path, sizeof(path), "/sys/class/infiniband/%s/device", ibdevName);
+  ssize_t n = readlink(path, link, sizeof(link) - 1);
+  if (n <= 0) {
+    ncclIbCopyString(outBdf, outLen, "unknown");
+    return -1;
+  }
+  link[n] = '\0';
+
+  const char* last = strrchr(link, '/');
+  const char* bdf = last ? last + 1 : link;
+
+  ncclIbCopyString(outBdf, outLen, bdf);
+  return 0;
+}
+
+static void bdf_to_card_key(const char* bdf, char* outCard, size_t outLen) {
+  if (!bdf || strlen(bdf) < 12) {
+    ncclIbCopyString(outCard, outLen, "unknown");
+    return;
+  }
+
+  char tmp[16];
+  memcpy(tmp, bdf, 10);
+  tmp[10] = '\0';
+  ncclIbCopyString(outCard, outLen, tmp);
+}
+
+static const char* getDeviceCardKey(const struct ncclIbSendCommDev* dev) {
+  return (dev && dev->cardKeyValid) ? dev->cardKey : "unknown";
+}
+
+static int getOrCreateCardId(const char* cardKey,
+                             char uniq[][16],
+                             uint16_t* uniqN,
+                             uint16_t maxCards) {
+  for (uint16_t i = 0; i < *uniqN; i++) {
+    if (strncmp(uniq[i], cardKey, sizeof(uniq[i])) == 0) {
+      return (int)i;
+    }
+  }
+
+  if (*uniqN < maxCards) {
+    ncclIbCopyString(uniq[*uniqN], sizeof(uniq[*uniqN]), cardKey);
+    return (int)(*uniqN)++;
+  }
+
+  return 0;
+}
+
 #define NCCL_IB_SL_DEFAULT 0
 #define NCCL_IB_TC_DEFAULT 0
 
@@ -439,6 +503,7 @@ fail:
 // delivered to the remote side (receiver) as part of the connection
 // establishment process.
 static ncclResult_t ncclIbSenderQpsCreate(ncclIbSendComm* comm, struct ncclIbConnectionMetadata* meta) {
+  const bool useFrm = !!ncclParamOciFrmEnable();
   uint nqps = comm->base.nqps;
   struct ncclIbQpCreateAttr qpCreateAttrs = {0};
   qpCreateAttrs.type = IBV_QPT_RC;
@@ -473,6 +538,18 @@ static ncclResult_t ncclIbSenderQpsCreate(ncclIbSendComm* comm, struct ncclIbCon
         (uint16_t)ncclParamIbPkey(),
         commDev->base.pd);
     localQp->devIndex = devIndex;
+
+    if (useFrm && !commDev->cardKeyValid) {
+      const char* ibName = ncclIbDevs[commDev->base.ibDevN].devName;
+      char pf[16] = "unknown";
+      char card[16] = "unknown";
+      if (read_ibdev_pci_bdf(ibName, pf, sizeof(pf)) == 0) {
+        bdf_to_card_key(pf, card, sizeof(card));
+      }
+      ncclIbCopyString(commDev->pciBdf, sizeof(commDev->pciBdf), pf);
+      ncclIbCopyString(commDev->cardKey, sizeof(commDev->cardKey), card);
+      commDev->cardKeyValid = 1;
+    }
 
     // Populate the metadata that will be delivered to the remote peer
     localQpInfo->qpn      = localQp->qp->qp_num;
@@ -543,6 +620,7 @@ ncclResult_t ncclIbConnect(void* ctx, int dev, void* opaqueHandle, void** sendCo
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)stage->comm;
   int ready;
   uint8_t link_layer = IBV_LINK_LAYER_UNSPECIFIED;
+  bool useFrm = !!ncclParamOciFrmEnable();
   *sendComm = NULL;
 
   if (stage->state == ncclIbCommStateConnect)      goto ib_connect_check;
@@ -606,6 +684,9 @@ ib_recv_dev_list:
   localNqps  = ncclParamIbQpsPerConn() * comm->base.vProps.ndevs; // We must have at least 1 qp per-device
   remoteNqps = ncclParamIbQpsPerConn() * remoteVProps.ndevs;
   comm->base.nqps = remoteNqps > localNqps ? remoteNqps : localNqps; // Select max nqps (local or remote)
+  if (useFrm) {
+    NCCLCHECKGOTO(ncclIbSendCommInitMultiSendScratch(comm), ret, fail);
+  }
 
   comm->base.nDataQps = std::max(comm->base.vProps.ndevs, remoteVProps.ndevs);
 
@@ -762,6 +843,39 @@ ib_connect:
 
   NCCLCHECKGOTO(ncclIbSenderQpsToRts(comm, &remMeta), ret, fail);
 
+  if (useFrm) {
+    comm->cim = CIM_Start(comm->base.nqps);
+    if (comm->cim != NULL) {
+      char uniq[16][16] = {};
+      uint16_t qpCardMap[NCCL_IB_MAX_QPS] = {};
+      uint16_t uniqN = 0;
+
+      for (int q = 0; q < comm->base.nqps; q++) {
+        int devIndex = comm->base.qps[q].devIndex;
+        const char* cardKey = getDeviceCardKey(&comm->devs[devIndex]);
+        int cardId = getOrCreateCardId(cardKey,
+                                       uniq,
+                                       &uniqN,
+                                       (uint16_t)(sizeof(uniq) / sizeof(uniq[0])));
+        qpCardMap[q] = (uint16_t)cardId;
+        comm->base.qps[q].sig_head = 0;
+        comm->base.qps[q].sig_tail = 0;
+        memset(comm->base.qps[q].sig_tsc, 0, sizeof(comm->base.qps[q].sig_tsc));
+        memset(comm->base.qps[q].sig_bytes, 0, sizeof(comm->base.qps[q].sig_bytes));
+        comm->base.frmFields.qp_lat[q] = 0;
+        comm->base.frmFields.qp_raw_lat[q] = 0;
+      }
+
+      CIM_SetQpCardMap(comm->cim, qpCardMap, comm->base.nqps, uniqN);
+
+      int ms = ncclParamOciLatPrintMs();
+      if (ms > 0) {
+        CIM_DebugLatPrinterStart(ms);
+      }
+    }
+    qpMapBuild(&comm->base);
+  }
+
   comm->base.ready = 1;
   stage->state = ncclIbCommStateConnected;
   stage->offset = 0;
@@ -776,6 +890,17 @@ exit:
   stage->state = ncclIbCommStateStart;
   return ret;
 fail:
+  if (comm != NULL) {
+    CIM_DebugLatPrinterSetWeightSource("lw", NULL, 0);
+    CIM_DebugLatPrinterSetSource("qp_lat", NULL, NULL, 0);
+    CIM_DebugLatPrinterSetSyncSeq(NULL);
+    CIM_DebugLatPrinterStop();
+    if (comm->cim != NULL) {
+      CIM_Stop(comm->cim);
+      comm->cim = NULL;
+    }
+    ncclIbSendCommFreeMultiSendScratch(comm);
+  }
   free(comm);
   goto exit;
 }
@@ -1238,6 +1363,15 @@ ncclResult_t ncclIbCloseSend(void* sendComm) {
     if (comm->base.resiliency) {
       NCCLCHECK(ncclIbResiliencyDestroy(&comm->base.resiliency));
     }
+    CIM_DebugLatPrinterSetWeightSource("lw", NULL, 0);
+    CIM_DebugLatPrinterSetSource("qp_lat", NULL, NULL, 0);
+    CIM_DebugLatPrinterSetSyncSeq(NULL);
+    CIM_DebugLatPrinterStop();
+    if (comm->cim != NULL) {
+      CIM_Stop(comm->cim);
+      comm->cim = NULL;
+    }
+    ncclIbSendCommFreeMultiSendScratch(comm);
     free(comm);
   }
   TIME_PRINT("IB");

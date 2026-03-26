@@ -1,5 +1,6 @@
 # Transport sources
 set(NET_IB_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/cim.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/common.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/connect.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/gdr.cc
