@@ -29,6 +29,28 @@ static inline bool ncclIbResiliencyQpIsTrafficReady(enum ncclIbResiliencyQpState
   return state == ncclIbResiliencyQpStateOk;
 }
 
+static inline void ibResiliencySetQpState(struct ncclIbResiliency* resCtx, int qpIndex,
+                                          enum ncclIbResiliencyQpState newState) {
+  assert(resCtx != NULL);
+  assert(resCtx->baseComm != NULL);
+  assert(qpIndex >= 0 && qpIndex < resCtx->baseComm->nqps);
+
+  struct ncclIbResiliencyQpInfo* qpInfo = &resCtx->qpInfo[qpIndex];
+  enum ncclIbResiliencyQpState oldState = qpInfo->state;
+  if (oldState == newState) return;
+
+  if (oldState == ncclIbResiliencyQpStateOk) {
+    resCtx->nonOkQps++;
+  }
+  if (newState == ncclIbResiliencyQpStateOk) {
+    resCtx->nonOkQps--;
+  }
+  assert(resCtx->nonOkQps >= 0);
+  assert(resCtx->nonOkQps <= resCtx->baseComm->nqps);
+
+  qpInfo->state = newState;
+}
+
 static inline void ncclIbResiliencyResetPeerReadyReadState(struct ncclIbResiliency* resCtx) {
   assert(resCtx != NULL);
   resCtx->peerReadyReadInFlight = false;
@@ -218,13 +240,13 @@ static ncclResult_t ncclIbResiliencyMarkQpRejoinFailure(struct ncclIbResiliency*
 
   ncclIbResiliencyReadyQpSetBit(resCtx->localReadyQpMask, qpIndex, false);
   ncclIbResiliencyReadyQpSetBit(resCtx->remoteReadyQpMask, qpIndex, false);
-  qpInfo->state = ncclIbResiliencyQpStateFailed;
+  ibResiliencySetQpState(resCtx, qpIndex, ncclIbResiliencyQpStateFailed);
   qpInfo->localPortRetryLogged = false;
   qpInfo->failCount++;
   resCtx->inProgress = true;
 
   if (qpInfo->failCount >= IB_RESILIENCY_QP_REJOIN_MAX_FAILURES) {
-    qpInfo->state = ncclIbResiliencyQpStateFailedPermanent;
+    ibResiliencySetQpState(resCtx, qpIndex, ncclIbResiliencyQpStateFailedPermanent);
     WARN("NET/IB: %s: Rejoin step %s exhausted retry budget for QP index %d (qp_num=%u, devIndex=%d, failCount=%d, comm=%p). Leaving the QP on failover permanently.",
          __func__, stage, qpIndex, qp->qp->qp_num, qp->devIndex, qpInfo->failCount, resCtx->baseComm);
     return ncclSuccess;
@@ -465,7 +487,7 @@ static ncclResult_t ncclIbResiliencyTryActivatePeerReadyQps(struct ncclIbResilie
     if (!ncclIbResiliencyReadyQpGetBit(resCtx->remoteReadyQpMask, qpIndex)) continue;
 
     resCtx->baseComm->activeQps[qpIndex] = &resCtx->baseComm->qps[qpIndex];
-    qpInfo->state = ncclIbResiliencyQpStateOk;
+    ibResiliencySetQpState(resCtx, qpIndex, ncclIbResiliencyQpStateOk);
     qpInfo->failCount = 0;
     qpInfo->lastAttemptNs = 0;
     qpInfo->localPortRetryLogged = false;
@@ -555,7 +577,7 @@ static ncclResult_t ncclIbResiliencyTryRejoinSingleQp(struct ncclIbResiliency* r
   // Publish local-ready; activation itself is gated on peer-ready intersection.
   ncclIbResiliencyReadyQpSetBit(resCtx->remoteReadyQpMask, qpIndex, false);
   ncclIbResiliencyReadyQpSetBit(resCtx->localReadyQpMask, qpIndex, true);
-  qpInfo->state = ncclIbResiliencyQpStateLocalReady;
+  ibResiliencySetQpState(resCtx, qpIndex, ncclIbResiliencyQpStateLocalReady);
   resCtx->peerReadyReadLogged = false;
   INFO(NCCL_NET, "NET/IB: %s: Locally rebuilt QP index %d (qp_num=%u, devIndex=%d, remQpn=%u, comm=%p). Waiting for peer-ready.",
        __func__, qpIndex, qp->qp->qp_num, qp->devIndex, qp->remQpn, resCtx->baseComm);
@@ -1021,6 +1043,7 @@ ncclResult_t ncclIbResiliencyInit(struct ncclIbNetCommBase* baseComm, struct ncc
   baseCtx->baseComm = baseComm;
   baseCtx->inProgress = false;
   baseCtx->outstandingRequests = 0;
+  baseCtx->nonOkQps = 0;
   memset(baseCtx->localReadyQpMask, 0, sizeof(baseCtx->localReadyQpMask));
   memset(baseCtx->remoteReadyQpMask, 0, sizeof(baseCtx->remoteReadyQpMask));
   memset(baseCtx->remoteReadyQpMaskRkeys, 0, sizeof(baseCtx->remoteReadyQpMaskRkeys));
@@ -1054,7 +1077,7 @@ ncclResult_t ncclIbResiliencyMarkQpFailed(struct ncclIbResiliency* resCtx, int q
   struct ncclIbResiliencyQpInfo* qpInfo = &resCtx->qpInfo[qpIndex];
   if (qpInfo->state == ncclIbResiliencyQpStateFailed || qpInfo->state == ncclIbResiliencyQpStateFailedPermanent) return ncclSuccess;
 
-  qpInfo->state = ncclIbResiliencyQpStateFailed;
+  ibResiliencySetQpState(resCtx, qpIndex, ncclIbResiliencyQpStateFailed);
   qpInfo->lastAttemptNs = clockNano();
   qpInfo->localPortRetryLogged = false;
   qpInfo->failCount++;

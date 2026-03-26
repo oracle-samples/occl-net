@@ -60,11 +60,7 @@ static inline uint32_t ibQpSigRingSize() {
 static inline bool ncclIbFrmResiliencyHealthy(const struct ncclIbNetCommBase* base) {
   if (base == NULL || base->resiliency == NULL) return true;
   if (base->resiliency->inProgress) return false;
-
-  for (int qpIndex = 0; qpIndex < base->nqps; qpIndex++) {
-    if (base->resiliency->qpInfo[qpIndex].state != ncclIbResiliencyQpStateOk) return false;
-  }
-  return true;
+  return base->resiliency->nonOkQps == 0;
 }
 
 static inline void ncclIbFrmFlushTelemetry(struct ncclIbSendComm* comm) {

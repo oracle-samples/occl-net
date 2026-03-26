@@ -248,27 +248,30 @@ struct ncclIbSendFifo {
 
 struct alignas(128) ncclIbQp {
   struct ibv_qp* qp;
-  // Cached local QP attributes used to restore INIT state during rejoin.
-  uint8_t ibPort;
-  unsigned int accessFlags;
   // The index of the device on which this QP was created on.
   int devIndex;
   // The index of the device on the remote side to which this QP is connected
   // to.
   int remDevIdx;
-  // Remote QP number paired with this local QP.
-  // This is required to rebuild QP state (RTR/RTS) after failures.
-  uint32_t remQpn;
-  // Cached remote reduced ECE parameters for data-QP rejoin.
-  struct ibv_ece remEce;
-  int remEceSupported;
   uint32_t sig_head;
   uint32_t sig_tail;
   uint64_t sig_tsc[QP_SIG_RING];
   uint32_t sig_bytes[QP_SIG_RING];
+  // Cached local QP attributes used to restore INIT state during rejoin.
+  unsigned int accessFlags;
+  // Remote QP number paired with this local QP.
+  // This is required to rebuild QP state (RTR/RTS) after failures.
+  uint32_t remQpn;
+  int remEceSupported;
+  uint8_t ibPort;
+  // Cached remote reduced ECE parameters for data-QP rejoin.
+  struct ibv_ece remEce;
 };
 static_assert(alignof(struct ncclIbQp) == 128, "ncclIbQp must be 128-byte aligned");
 static_assert((sizeof(struct ncclIbQp) % 128) == 0, "ncclIbQp size must be a 128-byte multiple");
+static_assert(offsetof(struct ncclIbQp, qp) == 0, "ncclIbQp::qp offset changed");
+static_assert(offsetof(struct ncclIbQp, sig_tsc) == 24, "ncclIbQp::sig_tsc should stay in the first 128B region");
+static_assert(offsetof(struct ncclIbQp, sig_bytes) == 88, "ncclIbQp::sig_bytes should stay in the first 128B region");
 
 // We need to support NCCL_NET_MAX_REQUESTS for each concurrent receive
 #define NET_IB_MAX_REQUESTS (NCCL_NET_MAX_REQUESTS*NCCL_NET_IB_MAX_RECVS)
@@ -332,9 +335,6 @@ struct alignas(128) ncclIbNetCommBase {
   bool isSend;
   struct ncclIbRequest reqs[NET_IB_MAX_REQUESTS];
   struct ncclIbQp qps[NCCL_IB_MAX_QPS];
-  // Array of pointers to the "actual" QPs that are used for data transfers.
-  // The pointers point to QPs in the ncclIbNetCommBase::qps[] array.
-  struct ncclIbQp* activeQps[NCCL_IB_MAX_QPS];
   uint64_t fifoHead;
   int nqps;
   int splitDataOnQps;
@@ -342,18 +342,31 @@ struct alignas(128) ncclIbNetCommBase {
   int ready;
   // Track necessary remDevInfo here
   int nRemDevs;
+  struct ncclIbDevInfo remDevs[NCCL_IB_MAX_DEVS_PER_NIC];
+  // statistics about the comm
+  struct ncclIbStats stats;
   int nDataQps;
+  struct ncclIbNetCommFrmFields frmFields;
+  // Array of pointers to the "actual" QPs that are used for data transfers.
+  // The pointers point to QPs in the ncclIbNetCommBase::qps[] array and may be
+  // remapped away from the physical qps[] order during failover/recovery.
+  struct ncclIbQp* activeQps[NCCL_IB_MAX_QPS];
   // Cached traffic-class and service-level used during QP bring-up.
   // Rejoin logic reuses these values when moving a failed QP back to RTR/RTS.
   int connTc;
   int connSl;
-  struct ncclIbDevInfo remDevs[NCCL_IB_MAX_DEVS_PER_NIC];
-  // statistics about the comm
-  struct ncclIbStats stats;
   struct ncclIbResiliency* resiliency;
-  struct ncclIbNetCommFrmFields frmFields;
 };
 static_assert(alignof(struct ncclIbNetCommBase) == 128, "ncclIbNetCommBase must be 128-byte aligned");
+static_assert(offsetof(struct ncclIbNetCommBase, reqs) < offsetof(struct ncclIbNetCommBase, frmFields), "reqs should stay ahead of frmFields");
+static_assert(offsetof(struct ncclIbNetCommBase, qps) < offsetof(struct ncclIbNetCommBase, frmFields), "qps should stay ahead of frmFields");
+static_assert(offsetof(struct ncclIbNetCommBase, remDevs) < offsetof(struct ncclIbNetCommBase, frmFields), "original remDev info should stay ahead of frmFields");
+static_assert(offsetof(struct ncclIbNetCommBase, stats) < offsetof(struct ncclIbNetCommBase, frmFields), "stats should stay ahead of frmFields");
+static_assert(offsetof(struct ncclIbNetCommBase, nDataQps) < offsetof(struct ncclIbNetCommBase, frmFields), "nDataQps should stay in the FRM block ahead of frmFields");
+static_assert(offsetof(struct ncclIbNetCommBase, activeQps) > offsetof(struct ncclIbNetCommBase, frmFields), "activeQps should stay in the resiliency-side block behind frmFields");
+static_assert(offsetof(struct ncclIbNetCommBase, connTc) > offsetof(struct ncclIbNetCommBase, frmFields), "connTc should stay behind frmFields");
+static_assert(offsetof(struct ncclIbNetCommBase, connSl) > offsetof(struct ncclIbNetCommBase, frmFields), "connSl should stay behind frmFields");
+static_assert(offsetof(struct ncclIbNetCommBase, resiliency) > offsetof(struct ncclIbNetCommBase, frmFields), "resiliency should stay behind frmFields");
 
 struct ncclIbNetCommDevBase* ncclIbGetNetCommDevBase(ncclIbNetCommBase* base, int devIndex);
 

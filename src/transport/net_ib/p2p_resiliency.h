@@ -90,6 +90,10 @@ struct ncclIbResiliency {
   // module.
   int outstandingRequests;
 
+  // Number of QPs on this communicator that are not in the traffic-ready `Ok`
+  // state. This lets hot-path FRM gating avoid rescanning `qpInfo[]`.
+  int nonOkQps;
+
   // Per-QP rejoin tracking. The implementation intentionally keeps the state
   // local to each communicator to avoid cross-comm coupling.
   struct ncclIbResiliencyQpInfo qpInfo[NCCL_IB_MAX_QPS];
