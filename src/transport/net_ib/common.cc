@@ -41,85 +41,7 @@ struct ncclIbNetCommDevBase* ncclIbGetNetCommDevBase(ncclIbNetCommBase* base, in
   }
 }
 
-static size_t ncclIbFrmRoundUpCacheline(size_t bytes) {
-  const size_t cacheline = 64;
-  return ((bytes + cacheline - 1) / cacheline) * cacheline;
-}
-
-void ncclIbSendCommFreeMultiSendScratch(struct ncclIbSendComm* comm) {
-  if (comm == NULL) return;
-
-  struct ncclIbMultiSendScratch* scratch = &comm->multiSendScratch;
-  free(scratch->storage);
-  scratch->storage = NULL;
-  scratch->nqps = 0;
-  scratch->chunkSizePerReq = NULL;
-  scratch->qpPerPost = NULL;
-  scratch->wrsPerPost = NULL;
-  scratch->sgesPerPost = NULL;
-  scratch->sendSzPerPost = NULL;
-}
-
-ncclResult_t ncclIbSendCommInitMultiSendScratch(struct ncclIbSendComm* comm) {
-  ncclResult_t ret = ncclSuccess;
-  if (comm == NULL) return ncclSuccess;
-
-  struct ncclIbMultiSendScratch* scratch = &comm->multiSendScratch;
-  const size_t nqps = (size_t)(comm->base.nqps > 0 ? comm->base.nqps : 0);
-  ncclIbSendCommFreeMultiSendScratch(comm);
-  scratch->nqps = (int)nqps;
-  if (nqps == 0) return ncclSuccess;
-
-  const size_t qpReqCount = nqps * NCCL_NET_IB_MAX_RECVS;
-  const size_t wrCount = nqps * (NCCL_NET_IB_MAX_RECVS + 1);
-
-  const size_t chunkBytes = ncclIbFrmRoundUpCacheline(qpReqCount * sizeof(size_t));
-  const size_t qpPtrBytes = ncclIbFrmRoundUpCacheline(nqps * sizeof(ncclIbQp*));
-  const size_t wrBytes = ncclIbFrmRoundUpCacheline(wrCount * sizeof(struct ibv_send_wr));
-  const size_t sgeBytes = ncclIbFrmRoundUpCacheline(qpReqCount * sizeof(struct ibv_sge));
-  const size_t sendSzBytes = ncclIbFrmRoundUpCacheline(qpReqCount * sizeof(size_t));
-  const size_t totalBytes = chunkBytes + qpPtrBytes + wrBytes + sgeBytes + sendSzBytes;
-
-  NCCLCHECKGOTO(ncclIbMalloc((void**)&scratch->storage, totalBytes), ret, fail);
-  memset(scratch->storage, 0, totalBytes);
-  {
-    char* ptr = (char*)scratch->storage;
-    scratch->chunkSizePerReq = (size_t*)ptr;
-    ptr += chunkBytes;
-    scratch->qpPerPost = (ncclIbQp**)ptr;
-    ptr += qpPtrBytes;
-    scratch->wrsPerPost = (struct ibv_send_wr*)ptr;
-    ptr += wrBytes;
-    scratch->sgesPerPost = (struct ibv_sge*)ptr;
-    ptr += sgeBytes;
-    scratch->sendSzPerPost = (size_t*)ptr;
-  }
-
-  for (size_t i = 0; i < nqps; i++) {
-    struct ibv_send_wr* wrRow = ncclIbMultiSendScratchWrRow(scratch, (int)i);
-    struct ibv_sge* sgeRow = ncclIbMultiSendScratchSgeRow(scratch, (int)i);
-
-    for (int r = 0; r < NCCL_NET_IB_MAX_RECVS; r++) {
-      wrRow[r].sg_list = &sgeRow[r];
-      wrRow[r].num_sge = 1;
-      wrRow[r].opcode = IBV_WR_RDMA_WRITE;
-      wrRow[r].send_flags = 0;
-      wrRow[r].next = (r == NCCL_NET_IB_MAX_RECVS - 1) ? &wrRow[NCCL_NET_IB_MAX_RECVS] : &wrRow[r + 1];
-    }
-
-    wrRow[NCCL_NET_IB_MAX_RECVS].opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-    wrRow[NCCL_NET_IB_MAX_RECVS].send_flags = IBV_SEND_SIGNALED;
-    wrRow[NCCL_NET_IB_MAX_RECVS].next = NULL;
-  }
-
-  return ncclSuccess;
-fail:
-  ncclIbSendCommFreeMultiSendScratch(comm);
-  return ret;
-}
-
 ncclResult_t ncclIbBaseCommInit(struct ncclIbNetCommBase* baseComm, bool isSend) {
-  memset(&baseComm->frmFields, 0, sizeof(baseComm->frmFields));
   for (int i = 0; i < NCCL_IB_MAX_QPS; i++) {
     baseComm->qps[i].ibPort = 0;
     baseComm->qps[i].accessFlags = 0;
@@ -128,10 +50,6 @@ ncclResult_t ncclIbBaseCommInit(struct ncclIbNetCommBase* baseComm, bool isSend)
     baseComm->qps[i].remQpn = 0;
     memset(&baseComm->qps[i].remEce, 0, sizeof(baseComm->qps[i].remEce));
     baseComm->qps[i].remEceSupported = 0;
-    baseComm->qps[i].sig_head = 0;
-    baseComm->qps[i].sig_tail = 0;
-    memset(baseComm->qps[i].sig_tsc, 0, sizeof(baseComm->qps[i].sig_tsc));
-    memset(baseComm->qps[i].sig_bytes, 0, sizeof(baseComm->qps[i].sig_bytes));
     baseComm->activeQps[i] = &baseComm->qps[i];
   }
   baseComm->nqps = -1;
@@ -169,9 +87,7 @@ ncclResult_t ncclIbRecvCommInit(struct ncclIbRecvComm* recvComm) {
 
 ncclResult_t ncclIbSendCommInit(struct ncclIbSendComm* sendComm) {
   NCCLCHECK(ncclIbBaseCommInit(&sendComm->base, true));
-  sendComm->cim = NULL;
-  memset(&sendComm->multiSendScratch, 0, sizeof(sendComm->multiSendScratch));
-  sendComm->frmGateOpen = false;
+  sendComm->sendWrIdCounter = 0;
   return ncclSuccess;
 }
 

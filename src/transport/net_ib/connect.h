@@ -39,9 +39,9 @@ struct ncclIbQpInfo {
 struct ncclIbResiliencyInfo {
   // QPs used for probing of data transfers in case of QP/device failures.
   struct ncclIbQpInfo probingQpsInfo[NCCL_IB_MAX_DEVS_PER_NIC];
-  // Exposed peer-ready bitmap used for QP rejoin synchronization.
-  uint64_t readyQpMaskAddr;
-  uint32_t readyQpMaskRkeys[NCCL_IB_MAX_DEVS_PER_NIC];
+  // Exposed peer-ready state used for QP rejoin synchronization.
+  uint64_t readyStateAddr;
+  uint32_t readyStateRkeys[NCCL_IB_MAX_DEVS_PER_NIC];
 };
 
 // Structure used to hold information needed to establish the communication

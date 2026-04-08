@@ -309,7 +309,6 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
   set(IB_TRANSPORT_PLUGIN_SOURCES
       ${CMAKE_CURRENT_SOURCE_DIR}/plugin/net/net_ib_plugin_v11.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/plugin/net/net_ib_plugin_stubs.cc
-      ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/cim.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/common.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/connect.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/gdr.cc

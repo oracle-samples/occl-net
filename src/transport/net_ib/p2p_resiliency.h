@@ -34,10 +34,10 @@ struct ncclIbResiliencyDev {
   // the receiver side as the memory is only used as a target for RDMA Read
   // operations initiated by the sender side.
   struct ibv_mr* probingResultMr;
-  // MR exposing local ready-QP bitmap to peer via RDMA read.
-  struct ibv_mr* readyQpMaskMr;
-  // MR used as local write target for RDMA-read of peer ready bitmap.
-  struct ibv_mr* peerReadyQpMaskMr;
+  // MR exposing local ready-state snapshot to peer via RDMA read.
+  struct ibv_mr* readyStateMr;
+  // MR used as local write target for RDMA-read of peer ready-state snapshot.
+  struct ibv_mr* peerReadyStateMr;
   // Temporary backoff window for auxiliary peer-ready reads on this device.
   uint64_t peerReadyRetryAfterNs;
   int peerReadyFailureCount;
@@ -61,6 +61,11 @@ struct ncclIbResiliencyQpInfo {
   // retry logs until the port becomes active again.
   bool localPortRetryLogged;
   int failCount;
+};
+
+struct ibReadyStateSnapshot {
+  uint64_t mask[(NCCL_IB_MAX_QPS + 63) / 64];
+  uint32_t epoch[NCCL_IB_MAX_QPS];
 };
 
 struct ncclIbResiliency {
@@ -90,21 +95,22 @@ struct ncclIbResiliency {
   // module.
   int outstandingRequests;
 
-  // Number of QPs on this communicator that are not in the traffic-ready `Ok`
-  // state. This lets hot-path FRM gating avoid rescanning `qpInfo[]`.
-  int nonOkQps;
-
   // Per-QP rejoin tracking. The implementation intentionally keeps the state
   // local to each communicator to avoid cross-comm coupling.
   struct ncclIbResiliencyQpInfo qpInfo[NCCL_IB_MAX_QPS];
 
-  // Local and remote ready-QP bitmaps used for peer-ready synchronization.
-  uint64_t localReadyQpMask[(NCCL_IB_MAX_QPS + 63) / 64];
-  uint64_t remoteReadyQpMask[(NCCL_IB_MAX_QPS + 63) / 64];
-  // Remote memory handle for peer-ready bitmap RDMA reads.
-  uint64_t remoteReadyQpMaskAddr;
-  uint32_t remoteReadyQpMaskRkeys[NCCL_IB_MAX_DEVS_PER_NIC];
-  // Bookkeeping for non-blocking RDMA read of peer-ready bitmap.
+  // Local and remote ready-state snapshots used for peer-ready synchronization.
+  // The epoch array makes each recovery cycle distinguishable so a later
+  // rejoin cannot be satisfied by a stale ready bit left over from an earlier
+  // recovery.
+  struct ibReadyStateSnapshot localReady;
+  struct ibReadyStateSnapshot remoteReady;
+  // Last remote ready epoch that was consumed when a local QP was activated.
+  uint32_t activatedRemoteReadyEpoch[NCCL_IB_MAX_QPS];
+  // Remote memory handle for peer-ready state RDMA reads.
+  uint64_t remoteReadyStateAddr;
+  uint32_t remoteReadyStateRkeys[NCCL_IB_MAX_DEVS_PER_NIC];
+  // Bookkeeping for non-blocking RDMA read of peer-ready state.
   bool peerReadyReadInFlight;
   int peerReadyReadQpIndex;
   int peerReadyReadDevIndex;
@@ -121,7 +127,10 @@ enum ncclIbResiliencyRequestSendState {
   ncclIbResiliencyRequestStateProbePosted,
   // The probe was completed. After this state, the request is either completed
   // or replayed.
-  ncclIbResiliencyRequestStateProbeCompleted
+  ncclIbResiliencyRequestStateProbeCompleted,
+  // The request was replayed and is waiting for either completion or a new
+  // error before another recovery cycle is armed.
+  ncclIbResiliencyRequestStateReplayPosted
 };
 
 struct ncclIbResiliencyErrorInfo {
@@ -140,11 +149,13 @@ struct ncclIbResiliencyRequestSend {
   struct ncclIbResiliencyErrorInfo errorInfo;
   int failedAttempts;
 
-  // It might be that an old CQE that belongs to a request that was already
-  // handled is still in the CQ. To safely ignore such old CQEs, this ever
-  // incrementing "generation ID" used to make sure that the CQE belongs to
-  // a request that was already handled so the CQE can be ignored.
+  // Tracks the last send-attempt CQE token associated with this slot. Reposts
+  // refresh the token so late CQEs from an older send attempt can be ignored
+  // without blocking a later error on the same still-live request from
+  // re-entering replay.
   uint64_t id;
+  // Unique WR ID for the currently posted probe, if any.
+  uint64_t probeWrId;
 };
 
 struct ncclIbResiliencyRemoteCompletionRecordsInfo {
@@ -154,13 +165,14 @@ struct ncclIbResiliencyRemoteCompletionRecordsInfo {
   uint32_t rkey;
 };
 
-struct ncclIbResiliencySend {
+  struct ncclIbResiliencySend {
   struct ncclIbResiliency base;
   // Array of requests that encountered an error. Requests in this array can be
   // waiting for probing and then possibly replay. Any request that encounters
-  // an error is added to this array. The request is removed from this array
-  // when it is either completed (if the probe shows that the receiver
-  // completed the request) or when it is replayed.
+  // an error is added to this array. If a replay is posted, the entry stays
+  // bound to the live request so a later error on the same request can arm a
+  // new recovery cycle while old CQEs are still filtered correctly. The
+  // request pointer is finally cleared when the request itself completes.
   // Note that multi-recv/send requests are considered as a single request.
   // Meaning, if one send request of a multi-send request encounters an error,
   // only the first send request is added here as a "representative" of the
@@ -183,6 +195,8 @@ struct ncclIbResiliencySend {
   // Stores information, per-device, used to access the completion records
   // structure on the receiver side.
   struct ncclIbResiliencyRemoteCompletionRecordsInfo remCmplRecordsInfo[NCCL_IB_MAX_DEVS_PER_NIC];
+  // Monotonic token source for uniquely identifying probe completions.
+  uint64_t nextProbeWrId;
 };
 
 // -----------------------------
@@ -247,5 +261,6 @@ ncclResult_t ncclIbResiliencyRemoteCompletionRecordsSet(struct ncclIbResiliency*
 // Rejoin APIs used by progress/error paths to mark and rehabilitate failed QPs.
 ncclResult_t ncclIbResiliencyMarkQpFailed(struct ncclIbResiliency* resCtx, int qpIndex);
 ncclResult_t ncclIbResiliencyTryRejoinQps(struct ncclIbResiliency* resCtx);
+ncclResult_t ncclIbResiliencySendRequestComplete(struct ncclIbResiliency* resCtx, struct ncclIbRequest* request);
 
 #endif // NET_IB_P2P_RESILIENCY_H_
