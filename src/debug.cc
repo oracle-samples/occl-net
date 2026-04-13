@@ -5,7 +5,7 @@
  * See LICENSE.txt for more license information
  *************************************************************************/
 
-#include "core.h"
+#include "debug.h"
 #include "nccl_net.h"
 #include <ctime>
 #include <stdlib.h>
@@ -375,7 +375,11 @@ void ncclDebugLog(ncclDebugLogLevel level, unsigned long flags, const char *file
 
   int cudaDev = 0;
   if (!(level == NCCL_LOG_TRACE && flags == NCCL_CALL)) {
+#ifndef OCCL_DISABLE_CUDA_RUNTIME
     (void)cudaGetDevice(&cudaDev);
+#else
+    cudaDev = -1;
+#endif
   }
 
   // Add level specific formatting. The format string from the call site is incorporated into this prefix.

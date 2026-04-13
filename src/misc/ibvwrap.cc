@@ -8,6 +8,10 @@
 #include "ibvwrap.h"
 #include <sys/types.h>
 #include <unistd.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <chrono>
 #include <mutex>
 #include <thread>
@@ -17,7 +21,9 @@
 #else
 #include "ibvcore.h"
 #endif
+#include "checks.h"
 #include "ibvsymbols.h"
+#include "param.h"
 
 static std::once_flag initOnceFlag;
 static ncclResult_t initResult;

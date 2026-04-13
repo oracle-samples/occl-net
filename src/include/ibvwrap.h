@@ -16,7 +16,8 @@
 #include "ibvcore.h"
 #endif
 
-#include "core.h"
+#include "debug.h"
+#include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
 

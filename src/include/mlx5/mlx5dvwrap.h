@@ -16,7 +16,6 @@
 #include "mlx5/mlx5dvcore.h"
 #endif
 
-#include "core.h"
 #include "ibvwrap.h"
 #include <sys/types.h>
 #include <unistd.h>

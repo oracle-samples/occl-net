@@ -259,22 +259,14 @@ set_target_properties(nccl_static PROPERTIES
 
 ###################### Create external plugin from built-in IB transport ############################
 option(BUILD_IB_TRANSPORT_PLUGIN "Build an external net plugin from transport/net_ib implementation" ON)
-option(OCCL_PLUGIN_STATIC_CUDART "Link the standalone IB transport plugin against the static CUDA runtime when available to avoid a hard libcudart.so major-version dependency" ON)
+option(OCCL_PLUGIN_STATIC_CUDART "Compatibility knob for older standalone plugin builds; ignored because the standalone IB transport plugin no longer links a GPU runtime" ON)
 option(OCCL_PLUGIN_STATIC_CXX_RUNTIME "Link the standalone IB transport plugin against static libstdc++ when supported while keeping libgcc shared to avoid host libstdc++.so.6 ABI mismatches without raising the glibc baseline unnecessarily" ON)
 
 if(BUILD_IB_TRANSPORT_PLUGIN)
   include(CMakePushCheckState)
   include(CheckCXXSourceCompiles)
-  set(occl_plugin_cuda_runtime_target CUDA::cudart)
   set(occl_plugin_cxx_runtime_linkage "dynamic")
   set(occl_plugin_cxx_runtime_link_options "")
-  if(OCCL_PLUGIN_STATIC_CUDART)
-    if(TARGET CUDA::cudart_static)
-      set(occl_plugin_cuda_runtime_target CUDA::cudart_static)
-    else()
-      message(WARNING "OCCL_PLUGIN_STATIC_CUDART=ON but CUDA::cudart_static is unavailable; falling back to CUDA::cudart for occl-net-ib-plugin")
-    endif()
-  endif()
   if(OCCL_PLUGIN_STATIC_CXX_RUNTIME)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
       unset(OCCL_PLUGIN_CAN_STATIC_LINK_CXX_RUNTIME CACHE)
@@ -303,7 +295,11 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
       message(WARNING "OCCL_PLUGIN_STATIC_CXX_RUNTIME=ON but compiler ${CMAKE_CXX_COMPILER_ID} does not support -static-libstdc++ flags; using dynamic C++ runtime for occl-net-ib-plugin")
     endif()
   endif()
-  message(STATUS "occl-net-ib-plugin CUDA runtime linkage: ${occl_plugin_cuda_runtime_target}")
+  if(OCCL_PLUGIN_STATIC_CUDART)
+    message(STATUS "occl-net-ib-plugin GPU runtime linkage: disabled (OCCL_PLUGIN_STATIC_CUDART is ignored for the host-only standalone build)")
+  else()
+    message(STATUS "occl-net-ib-plugin GPU runtime linkage: disabled (host-side verbs plus DMA-BUF)")
+  endif()
   message(STATUS "occl-net-ib-plugin C++ runtime linkage: ${occl_plugin_cxx_runtime_linkage}")
 
   set(IB_TRANSPORT_PLUGIN_SOURCES
@@ -322,7 +318,6 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
       ${CMAKE_CURRENT_SOURCE_DIR}/misc/ibvsymbols.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/misc/mlx5dvwrap.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/misc/mlx5dvsymbols.cc
-      ${CMAKE_CURRENT_SOURCE_DIR}/misc/cudawrap.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/misc/param.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/misc/utils.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/misc/nvmlwrap.cc
@@ -344,6 +339,7 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
       ${CMAKE_BINARY_DIR}/include
       ${CMAKE_BINARY_DIR}/obj/include
   )
+  target_compile_definitions(occl-net-ib-plugin PRIVATE OCCL_DISABLE_CUDA_RUNTIME=1)
 
   # Build as standalone plugin without linking nccl_static to avoid pulling
   # the full device kernel build graph.
@@ -351,7 +347,6 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
     PRIVATE
       Threads::Threads
       ${CMAKE_DL_LIBS}
-      ${occl_plugin_cuda_runtime_target}
       ${EXTRA_LIBS}
   )
   target_link_options(occl-net-ib-plugin PRIVATE
@@ -366,6 +361,20 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
       PREFIX "lib"
       POSITION_INDEPENDENT_CODE ON
       LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  )
+
+  set(occl_net_ib_plugin_aliases
+      "${CMAKE_BINARY_DIR}/lib/libnccl-net-occl-ib.so"
+      "${CMAKE_BINARY_DIR}/lib/librccl-net-occl-ib.so"
+  )
+  add_custom_command(TARGET occl-net-ib-plugin POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$<TARGET_FILE:occl-net-ib-plugin>"
+      "${CMAKE_BINARY_DIR}/lib/libnccl-net-occl-ib.so"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$<TARGET_FILE:occl-net-ib-plugin>"
+      "${CMAKE_BINARY_DIR}/lib/librccl-net-occl-ib.so"
+    VERBATIM
   )
 endif()
 
@@ -382,6 +391,10 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+  )
+  install(FILES ${occl_net_ib_plugin_aliases}
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    OPTIONAL
   )
 endif()
 

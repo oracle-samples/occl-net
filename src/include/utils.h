@@ -9,7 +9,9 @@
 #define NCCL_UTILS_H_
 
 #include "nccl.h"
+#ifndef OCCL_DISABLE_CUDA_RUNTIME
 #include "alloc.h"
+#endif
 #include "bitops.h"
 #include "checks.h"
 #include "compiler.h"

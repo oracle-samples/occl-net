@@ -71,7 +71,7 @@ ncclResult_t buildIbvSymbols(struct ncclIbvSymbols* ibvSymbols) {
 /* RDMA-core dynamic loading mode. Symbols are loaded from shared objects. */
 
 #include <dlfcn.h>
-#include "core.h"
+#include "debug.h"
 
 // IBVERBS Library versioning
 #define IBVERBS_VERSION "IBVERBS_1.1"

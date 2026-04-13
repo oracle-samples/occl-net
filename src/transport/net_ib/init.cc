@@ -421,11 +421,14 @@ ncclResult_t ncclIbGetPhysProperties(int dev, ncclNetProperties_t* props) {
   props->pciPath = ibDev->pciPath;
   props->guid = ibDev->guid;
   props->ptrSupport = NCCL_PTR_HOST;
-  if (ncclIbGdrSupport() == ncclSuccess) {
-    props->ptrSupport |= NCCL_PTR_CUDA; // GDR support via nv_peermem
+  bool dmaBufSupported = ncclIbDmaBufSupport(dev) == ncclSuccess;
+  if (ncclIbGdrSupport() == ncclSuccess || dmaBufSupported) {
+    // The plugin ABI keeps the GPU pointer token name even when the underlying
+    // device runtime is ROCm. DMA-BUF therefore still needs NCCL_PTR_CUDA set.
+    props->ptrSupport |= NCCL_PTR_CUDA;
   }
   props->regIsGlobal = 1;
-  if (ncclIbDmaBufSupport(dev) == ncclSuccess) {
+  if (dmaBufSupported) {
     props->ptrSupport |= NCCL_PTR_DMABUF; // GDR support via DMA-BUF
   }
   props->forceFlush = 0;

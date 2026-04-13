@@ -9,7 +9,13 @@
 #define NET_IB_COMMON_H_
 
 #include "nccl.h"
+#ifdef OCCL_DISABLE_CUDA_RUNTIME
+#include "debug.h"
+#include "checks.h"
+#include "standalone_host_alloc.h"
+#else
 #include "core.h"
+#endif
 #include "socket.h"
 #include "plugin/nccl_net.h"
 #include "utils.h"

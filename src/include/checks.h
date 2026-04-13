@@ -10,6 +10,20 @@
 
 #include "debug.h"
 
+#ifdef OCCL_DISABLE_CUDA_RUNTIME
+typedef int cudaError_t;
+enum { cudaSuccess = 0 };
+static inline const char* occlGpuRuntimeDisabledErrorString(cudaError_t err) {
+  (void)err;
+  return "GPU runtime disabled";
+}
+static inline cudaError_t occlGpuRuntimeDisabledGetLastError(void) {
+  return cudaSuccess;
+}
+#define cudaGetErrorString occlGpuRuntimeDisabledErrorString
+#define cudaGetLastError occlGpuRuntimeDisabledGetLastError
+#endif
+
 // Check CUDA RT calls
 #define CUDACHECK(cmd)                                                         \
   do {                                                                         \

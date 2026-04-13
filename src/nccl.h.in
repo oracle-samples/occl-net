@@ -8,6 +8,9 @@
 #ifndef NCCL_H_
 #define NCCL_H_
 
+#include <stddef.h>
+
+#ifndef OCCL_DISABLE_CUDA_RUNTIME
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #if CUDART_VERSION >= 11000
@@ -15,6 +18,9 @@
 #endif
 #if __cplusplus && CUDART_VERSION >= 11080
 #include <cuda_fp8.h>
+#endif
+#else
+typedef void* cudaStream_t;
 #endif
 
 #define NCCL_MAJOR ${nccl:Major}

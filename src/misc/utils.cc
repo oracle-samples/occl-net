@@ -6,15 +6,17 @@
  *************************************************************************/
 
 #include "utils.h"
-#include "core.h"
+#include "param.h"
 #include "os.h"
 
-#include "nvmlwrap.h"
-
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <mutex>
 
 // Get current Compute Capability
+#ifndef OCCL_DISABLE_CUDA_RUNTIME
 int ncclCudaCompCap() {
   int cudaDev;
   if (!CUDASUCCESS(cudaGetDevice(&cudaDev))) return 0;
@@ -23,6 +25,11 @@ int ncclCudaCompCap() {
   if (!CUDASUCCESS(cudaDeviceGetAttribute(&ccMinor, cudaDevAttrComputeCapabilityMinor, cudaDev))) return 0;
   return ccMajor*10+ccMinor;
 }
+#else
+int ncclCudaCompCap() {
+  return 0;
+}
+#endif
 
 ncclResult_t int64ToBusId(int64_t id, char* busId) {
   sprintf(busId, "%04lx:%02lx:%02lx.%01lx", (id) >> 20, (id & 0xff000) >> 12, (id & 0xff0) >> 4, (id & 0xf));
@@ -59,6 +66,7 @@ ncclResult_t pciPathToInt64(char* path, int64_t* id) {
 }
 
 // Convert a logical cudaDev index to the NVML device minor number
+#ifndef OCCL_DISABLE_CUDA_RUNTIME
 ncclResult_t getBusId(int cudaDev, int64_t *busId) {
   // On most systems, the PCI bus ID comes back as in the 0000:00:00.0
   // format. Still need to allocate proper space in case PCI domain goes
@@ -68,6 +76,13 @@ ncclResult_t getBusId(int cudaDev, int64_t *busId) {
   NCCLCHECK(busIdToInt64(busIdStr, busId));
   return ncclSuccess;
 }
+#else
+ncclResult_t getBusId(int cudaDev, int64_t *busId) {
+  (void)cudaDev;
+  if (busId) *busId = 0;
+  return ncclInternalError;
+}
+#endif
 
 ncclResult_t getHostName(char* hostname, int maxlen, const char delim) {
   if (gethostname(hostname, maxlen) != 0) {

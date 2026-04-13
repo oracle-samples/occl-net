@@ -26,7 +26,7 @@ ncclResult_t buildMlx5dvSymbols(struct ncclMlx5dvSymbols* mlx5dvSymbols) {
 /* Mlx5dv dynamic loading mode. Symbols are loaded from shared objects. */
 
 #include <dlfcn.h>
-#include "core.h"
+#include "debug.h"
 
 // MLX5DV Library versioning
 #define MLX5DV_VERSION "MLX5_1.8"

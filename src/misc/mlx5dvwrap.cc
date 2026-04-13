@@ -8,6 +8,8 @@
 #include "mlx5/mlx5dvwrap.h"
 #include <sys/types.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
 #include <mutex>
 
 #ifdef NCCL_BUILD_MLX5DV

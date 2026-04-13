@@ -17,10 +17,10 @@
 #include <cstdlib>
 
 #include "env.h"
-#include "mem_manager.h"
 
-// Standalone net_ib plugin build does not link full NCCL core init/memory-manager
-// objects. Provide minimal symbols required by shared utility objects.
+// Standalone net_ib plugin build does not link the full core environment
+// initialization objects. Provide the minimal symbols required by shared
+// utility code.
 
 ncclResult_t ncclInitEnv(void) {
   return ncclSuccess;
@@ -36,24 +36,4 @@ bool ncclEnvPluginInitialized(void) {
 
 int ncclParamSetCpuStackSize(void) {
   return 1;
-}
-
-ncclResult_t ncclMemTrack(struct ncclMemManager* manager, void* ptr, size_t size,
-                          CUmemGenericAllocationHandle handle,
-                          CUmemAllocationHandleType handleType,
-                          ncclMemType_t memType) {
-  (void)manager;
-  (void)ptr;
-  (void)size;
-  (void)handle;
-  (void)handleType;
-  (void)memType;
-  return ncclSuccess;
-}
-
-ncclResult_t ncclMemUntrack(struct ncclMemManager* manager, void* ptr, size_t size) {
-  (void)manager;
-  (void)ptr;
-  (void)size;
-  return ncclSuccess;
 }

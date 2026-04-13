@@ -16,11 +16,6 @@
 
 #include "plugin/nccl_net.h"
 #include "transport/net_ib/common.h"
-#include "gdrwrap.h"
-
-// Standalone external plugin build does not link src/init.cc where this symbol
-// is normally defined in the full NCCL library.
-gdr_t ncclGdrCopy = nullptr;
 
 static void* gLegacyCtx = nullptr;
 static int gLegacyRefCount = 0;
