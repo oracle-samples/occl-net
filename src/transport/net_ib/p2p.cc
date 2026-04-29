@@ -260,7 +260,9 @@ void ncclIbSendReqsRefreshWrIdToken(struct ncclIbSendComm* comm, int slot, int n
   assert(slot >= 0 && slot < NET_IB_MAX_REQUESTS);
   assert(nreqs > 0 && nreqs <= NCCL_NET_IB_MAX_RECVS);
 
-  uint64_t wrId = ibSendReqWrIdEncode(comm->sendWrIdCounter++, slot);
+  struct ncclIbRequest* req = comm->sendReqs[slot][0];
+  assert(req != NULL);
+  uint64_t wrId = ibReqWrIdEncode(req->id);
   for (int r = 0; r < nreqs; r++) {
     assert(comm->sendReqs[slot][r] != NULL);
     comm->sendReqs[slot][r]->send.wrIdToken = wrId;
