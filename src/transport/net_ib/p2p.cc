@@ -30,9 +30,8 @@ static constexpr int kIbMultiSendAlign = 128;
 
 static inline uint64_t wrid_pack_with_qp(uint64_t req_pack, uint32_t qpIndex) {
   (void)qpIndex;
-  // The current send WR-ID token already uses the high bits for epoch/slot
-  // tracking. Do not overload it with FRM metadata; completion-side QP mapping
-  // is rebuilt from wc->qp_num instead.
+  // OCCL resiliency already uses the high bits for epoch/slot tracking.
+  // Keep the token unchanged and rebuild FRM QP mapping from wc->qp_num.
   return req_pack;
 }
 
@@ -62,7 +61,7 @@ static inline bool ibFrmResiliencyHealthy(const struct ncclIbNetCommBase* base) 
 static inline void ibFrmFlushTelemetry(struct ncclIbSendComm* comm) {
   if (comm == NULL) return;
 
-  const bool dbgLatEnabled = (comm->cim != NULL) && (ncclParamOciLatPrintMs() > 0);
+  const bool dbgLatEnabled = (comm->cim != NULL) && (FRM_LAT_PRINT_MS > 0);
   if (dbgLatEnabled) {
     (void)__atomic_add_fetch(&comm->cim->dbg_seq, 1u, __ATOMIC_RELEASE);
   }
@@ -74,8 +73,10 @@ static inline void ibFrmFlushTelemetry(struct ncclIbSendComm* comm) {
   for (int qpIndex = 0; qpIndex < comm->base.nqps; qpIndex++) {
     ncclIbQp* qp = &comm->base.qps[qpIndex];
     qp->sig_tail = qp->sig_head;
+    qp->sig_req_tail = qp->sig_head;
     memset(qp->sig_tsc, 0, sizeof(qp->sig_tsc));
     memset(qp->sig_bytes, 0, sizeof(qp->sig_bytes));
+    memset(qp->sig_req, 0, sizeof(qp->sig_req));
   }
 
   if (comm->cim != NULL) {
@@ -132,16 +133,12 @@ static inline void ibFrmComputeLw(struct ncclIbSendComm* comm, int nqps, float* 
   if (split) {
     CIM_latencyToWeightsDirect(comm->base.frmFields.qp_lat, nqps, lwArr, &is_equal);
     if (is_equal) {
-      const float eq = 1.0f / (float)nqps;
-      for (int q = 0; q < nqps; q++) lwArr[q] = eq;
       return;
     }
-    gate_move_and_normalize(comm->cim, lwArr, nqps);
     return;
   }
 
   CIM_computeActiveWindowWeights(comm->base.frmFields.qp_lat, baseN, curQpIndex, nDataQ, lwArr);
-  gate_move_and_normalize(comm->cim, lwArr, nqps);
 
   float sumLw = 0.0f;
   for (int i = 0; i < nqps; i++) sumLw += lwArr[i];
@@ -155,15 +152,20 @@ static inline void ibFrmComputeLw(struct ncclIbSendComm* comm, int nqps, float* 
 
 static_assert((QP_SIG_RING & (QP_SIG_RING - 1)) == 0, "QP_SIG_RING must be a power of two");
 
-static inline void ibQpSigPush(ncclIbQp* qp, uint64_t tsc, uint32_t bytes) {
+static inline void ibQpSigPush(ncclIbQp* qp, struct ncclIbRequest* req, uint64_t tsc, uint32_t bytes) {
   uint32_t head = qp->sig_head;
   uint32_t tail = qp->sig_tail;
+  uint32_t req_tail = qp->sig_req_tail;
   if (__builtin_expect((head - tail) >= QP_SIG_RING, 0)) {
     qp->sig_tail = tail + 1;
+  }
+  if (__builtin_expect((head - req_tail) >= QP_SIG_RING, 0)) {
+    qp->sig_req_tail = req_tail + 1;
   }
   const uint32_t slot = head & (QP_SIG_RING - 1u);
   qp->sig_tsc[slot] = tsc;
   qp->sig_bytes[slot] = bytes;
+  qp->sig_req[slot] = req;
   qp->sig_head = head + 1;
 }
 
@@ -174,6 +176,16 @@ static inline int ibQpSigPop(ncclIbQp* qp, uint64_t* out_t0, uint32_t* out_bytes
   *out_t0 = qp->sig_tsc[slot];
   *out_bytes = qp->sig_bytes[slot];
   qp->sig_tail = tail + 1;
+  return 1;
+}
+
+static inline int ibQpSigPopReq(ncclIbQp* qp, struct ncclIbRequest** out_req) {
+  const uint32_t tail = qp->sig_req_tail;
+  if (__builtin_expect(tail == qp->sig_head, 0)) return 0;
+  const uint32_t slot = tail & (QP_SIG_RING - 1u);
+  *out_req = qp->sig_req[slot];
+  qp->sig_req[slot] = NULL;
+  qp->sig_req_tail = tail + 1;
   return 1;
 }
 
@@ -497,7 +509,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   const int nqps = ncclIbCommBaseGetNqpsPerRequest(&comm->base);
   const bool split = comm->base.splitDataOnQps == 1;
   const int activeBaseIx = reqs[0]->id % comm->base.nqps;
-  const bool dbgLatEnabled = (comm->cim != NULL) && (ncclParamOciLatPrintMs() > 0);
+  const bool dbgLatEnabled = (comm->cim != NULL) && (FRM_LAT_PRINT_MS > 0);
   uint8_t attemptOrder[NCCL_IB_MAX_QPS] = {0};
   int physicalQpIndexByPost[NCCL_IB_MAX_QPS] = {0};
 #if FRM_DEBUG
@@ -621,7 +633,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       postSges[0].addr = curSgeAddr;
 
       if (needImmWr) {
-        signaledWr->wr_id = 0ULL;
+        signaledWr->wr_id = wridForPost;
         signaledWr->opcode = IBV_WR_RDMA_WRITE;
         signaledWr->send_flags = 0;
         signaledWr->next = postImmWr;
@@ -740,7 +752,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
         dataWrSlotByReq[r] = wrSlot;
 #endif
 
-        postWr->wr_id = 0ULL;
+        postWr->wr_id = wrid_pack_with_qp(wr_id, (uint32_t)logicalQpIndex);
         postWr->opcode = IBV_WR_RDMA_WRITE;
         postWr->send_flags = 0;
         postWr->next = NULL;
@@ -823,7 +835,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
     struct ibv_send_wr* postImmWr = &postWrs[NCCL_NET_IB_MAX_RECVS];
     struct ibv_send_wr* postHeadWr = (scratch->chainBytesPerPost[p] == 0) ? postImmWr : &postWrs[0];
 
-    ibQpSigPush(qp, spt0, scratch->chainBytesPerPost[p]);
+    ibQpSigPush(qp, reqs[0], spt0, scratch->chainBytesPerPost[p]);
     NCCLCHECK(wrap_ibv_post_send(qp->qp, postHeadWr, &bad_wr));
 
     if (comm->base.resiliency) {
@@ -1163,7 +1175,20 @@ static int getReqQpIndex(struct ncclIbRequest* req, int request, int qpNumber) {
 }
 #endif
 
-static inline ncclResult_t ncclIbRequestRetrieveFromCompletion(struct ncclIbNetCommBase* base, ibv_wc* wc, ncclIbRequest** req) {
+static inline struct ncclIbRequest* ibSendReqPopByQp(struct ncclIbSendComm* sendComm, uint32_t qpNum, int devIndex) {
+  if (sendComm == NULL || !sendComm->frmGateOpen) return NULL;
+
+  ncclIbQp* qp = NULL;
+  if (ncclIbCommBaseGetQpByQpNum(&sendComm->base, devIndex, qpNum, &qp, NULL) != ncclSuccess || qp == NULL) {
+    return NULL;
+  }
+
+  struct ncclIbRequest* req = NULL;
+  if (!ibQpSigPopReq(qp, &req)) return NULL;
+  return req;
+}
+
+static inline ncclResult_t ncclIbRequestRetrieveFromCompletion(struct ncclIbNetCommBase* base, ibv_wc* wc, int devIndex, ncclIbRequest** req) {
   assert(req != NULL);
   assert(wc != NULL);
 
@@ -1186,9 +1211,10 @@ static inline ncclResult_t ncclIbRequestRetrieveFromCompletion(struct ncclIbNetC
   } else if (!base->isSend && ibReqWrIdIsRequest(wc->wr_id)) {
     struct ncclIbRecvComm* recvComm = (struct ncclIbRecvComm*)base;
     *req = ibRecvReqFind(recvComm, ibReqWrIdDecode(wc->wr_id));
-  } else if (base->isSend && ibReqWrIdIsRequest(wc->wr_id)) {
+  } else if (base->isSend) {
     struct ncclIbSendComm* sendComm = (struct ncclIbSendComm*)base;
-    *req = ibSendReqFindByWrId(sendComm, wc->wr_id);
+    *req = ibSendReqPopByQp(sendComm, wc->qp_num, devIndex);
+    if (*req == NULL) *req = ibSendReqFindByWrId(sendComm, wc->wr_id);
   } else {
     *req = NULL;
   }
@@ -1279,7 +1305,7 @@ static inline ncclResult_t ncclIbCompletionEventProcess(struct ncclIbNetCommBase
   ncclSocketGetAddr(&commBase->sock, &addr);
 
   struct ncclIbRequest* req = NULL;
-  NCCLCHECK(ncclIbRequestRetrieveFromCompletion(commBase, wc, &req));
+  NCCLCHECK(ncclIbRequestRetrieveFromCompletion(commBase, wc, devIndex, &req));
   if (req == NULL) {
     if (commBase->resiliency != NULL) {
       INFO(NCCL_NET, "NET/IB: %s: Ignoring stale successful completion with no live request binding (comm=%p, wc.wr_id=%ld, opcode=%d, qp_num=%u).",
@@ -1418,7 +1444,7 @@ static inline void ibFrmUpdateLatencyStamp(struct ncclIbRequest* req, struct ibv
   uint64_t t1 = timer_get_cycles();
   if (t0 == 0 || t1 <= t0) return;
 
-  double inv = g_inv_cyc_per_us;
+  const double inv = (g_inv_cyc_per_us > 0.0) ? g_inv_cyc_per_us : 0.0;
   uint64_t us = (inv > 0.0) ? (uint64_t)((double)(t1 - t0) * inv) : 0;
   if (captureRawLat) {
     req->base->frmFields.qp_raw_lat[qpIndex] = us;
@@ -1492,7 +1518,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
   if (!ibFrmEnabledForTest(r)) return ibTestBaseline(request, done, sizes);
 
   struct ncclIbSendComm* frmComm = (struct ncclIbSendComm*)r->base;
-  const bool captureRawLat = (ncclParamOciLatPrintMs() > 0);
+  constexpr bool captureRawLat = (FRM_LAT_PRINT_MS > 0);
   bool frmTelemetryEnabled = true;
   int totalWrDone = 0;
   int wrDone = 0;

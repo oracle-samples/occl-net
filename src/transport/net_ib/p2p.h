@@ -16,7 +16,10 @@ static_assert(NCCL_IB_FLUSH_REQ_WR_ID_OFFSET <= UINT64_MAX - NET_IB_MAX_REQUESTS
 #define IB_REQ_WR_ID_FLAG (1ULL << 63)
 #define IB_SEND_REQ_WR_ID_SLOT_BITS 8
 #define IB_SEND_REQ_WR_ID_SLOT_MASK ((1ULL << IB_SEND_REQ_WR_ID_SLOT_BITS) - 1)
+#define IB_SEND_REQ_WR_ID_EPOCH_BITS 24
+#define IB_SEND_REQ_WR_ID_EPOCH_VALUES ((1ULL << IB_SEND_REQ_WR_ID_EPOCH_BITS) - 1)
 static_assert(NET_IB_MAX_REQUESTS <= (1 << IB_SEND_REQ_WR_ID_SLOT_BITS), "send wr_id slot encoding must cover all request slots");
+static_assert((IB_SEND_REQ_WR_ID_SLOT_BITS + IB_SEND_REQ_WR_ID_EPOCH_BITS) <= 32, "send wr_id must remain stable if CQEs preserve only low 32 bits");
 
 ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, struct ncclIbRequest* req, int slot);
 ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot);
@@ -38,12 +41,13 @@ static inline uint64_t ibReqWrIdDecode(uint64_t wrId) {
 
 static inline uint64_t ibSendReqWrIdEncode(uint64_t epoch, uint64_t slot) {
   assert(slot < NET_IB_MAX_REQUESTS);
-  assert((epoch >> (63 - IB_SEND_REQ_WR_ID_SLOT_BITS)) == 0);
-  return IB_REQ_WR_ID_FLAG | (epoch << IB_SEND_REQ_WR_ID_SLOT_BITS) | slot;
+  // Keep send WR-IDs entirely in the low 32 bits. Some stacks appear to
+  // preserve only the lower portion of the WR-ID in successful send CQEs.
+  const uint64_t epochTag = (epoch % IB_SEND_REQ_WR_ID_EPOCH_VALUES) + 1ULL;
+  return (epochTag << IB_SEND_REQ_WR_ID_SLOT_BITS) | slot;
 }
 
 static inline uint64_t ibSendReqWrIdDecodeSlot(uint64_t wrId) {
-  assert(ibReqWrIdIsRequest(wrId));
   return wrId & IB_SEND_REQ_WR_ID_SLOT_MASK;
 }
 
@@ -53,9 +57,10 @@ static inline struct ncclIbRequest* ibSendReqFind(struct ncclIbSendComm* sendCom
 }
 
 static inline struct ncclIbRequest* ibSendReqFindByWrId(struct ncclIbSendComm* sendComm, uint64_t wrId) {
-  if (!ibReqWrIdIsRequest(wrId)) return NULL;
   struct ncclIbRequest* req = sendComm->sendReqs[ibSendReqWrIdDecodeSlot(wrId)][0];
-  return (req != NULL && req->send.wrIdToken == wrId && req->type == NCCL_NET_IB_REQ_SEND) ? req : NULL;
+  if (req == NULL || req->type != NCCL_NET_IB_REQ_SEND) return NULL;
+  const uint32_t token = (uint32_t)req->send.wrIdToken;
+  return (token != 0 && token == (uint32_t)wrId) ? req : NULL;
 }
 
 static inline struct ncclIbRequest* ibRecvReqFind(struct ncclIbRecvComm* recvComm, uint64_t reqId) {

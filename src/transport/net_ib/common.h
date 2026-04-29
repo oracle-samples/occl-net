@@ -32,6 +32,12 @@
 #include "ibvwrap.h"
 #include "mlx5/mlx5dvwrap.h"
 
+#ifndef FRM_LAT_PRINT_MS
+// Build-time trace knob for CIM latency/weight snapshots.
+// 0 disables tracing; any positive value enables it and sets the print interval in ms.
+#define FRM_LAT_PRINT_MS 0
+#endif
+
 #define MAXSUFFIXSIZE 16
 #define MAXNAMESIZE (64 + MAXSUFFIXSIZE)
 extern char ncclIbIfName[MAX_IF_NAME_SIZE+1];
@@ -260,6 +266,8 @@ struct alignas(128) ncclIbQp {
   uint32_t sig_tail;
   uint64_t sig_tsc[QP_SIG_RING];
   uint32_t sig_bytes[QP_SIG_RING];
+  uint32_t sig_req_tail;
+  struct ncclIbRequest* sig_req[QP_SIG_RING];
   // Cached local QP attributes used to restore INIT state during rejoin.
   unsigned int accessFlags;
   // Remote QP number paired with this local QP.
@@ -684,7 +692,6 @@ static inline void qpMapBuild(ncclIbNetCommBase* base) {
 }
 
 int64_t ncclParamOciFrmEnable();
-int64_t ncclParamOciLatPrintMs();
 extern double g_inv_cyc_per_us;
 
 #endif

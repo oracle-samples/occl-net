@@ -20,7 +20,6 @@ NCCL_PARAM(IbSl, "IB_SL", -1);
 NCCL_PARAM(IbTc, "IB_TC", -1);
 NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", -1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
-NCCL_PARAM(OciLatPrintMs, "OCI_LAT_PRINT_MS", 0);
 
 enum ncclIbCommState {
   ncclIbCommStateStart = 0,
@@ -781,9 +780,8 @@ ib_connect:
         comm->base.frmFields.qp_zero_stamp_holdoff[q] = 0;
       }
 
-      int ms = ncclParamOciLatPrintMs();
-      if (ms > 0) {
-        CIM_DebugLatPrinterStart(ms);
+      if (FRM_LAT_PRINT_MS > 0) {
+        CIM_DebugLatPrinterStart(FRM_LAT_PRINT_MS);
       }
     }
     qpMapBuild(&comm->base);
