@@ -9,24 +9,56 @@
 #define NCCL_TIMER_H_
 #include <stdint.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/time.h>
+#if defined(__i386__) || defined(__x86_64__)
 #include <x86intrin.h>
+#endif
+
+static inline uint64_t timer_get_cycles(void) {
+#if defined(__i386__) || defined(__x86_64__)
+  return __rdtsc();
+#elif defined(__aarch64__)
+  uint64_t cycles;
+  asm volatile("mrs %0, cntvct_el0" : "=r"(cycles));
+  return cycles;
+#else
+  struct timespec ts;
+#ifdef CLOCK_MONOTONIC_RAW
+  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+#else
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+  return (uint64_t)ts.tv_sec*1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
 static double freq = -1;
+
 static void calibrate() {
+#if defined(__aarch64__)
+  uint64_t freqHz;
+  asm volatile("mrs %0, cntfrq_el0" : "=r"(freqHz));
+  freq = (double)freqHz/1.0E6;
+  return;
+#elif !defined(__i386__) && !defined(__x86_64__)
+  freq = 1000.0;
+  return;
+#endif
+
   struct timeval tv;
   gettimeofday(&tv, NULL);
-  uint64_t timeCycles = __rdtsc();
+  uint64_t timeCycles = timer_get_cycles();
   double time = - tv.tv_sec*1E6 - tv.tv_usec;
-  uint64_t total = 0ULL;
-  for (int i=0; i<10000; i++) total += __rdtsc();
+  for (int i=0; i<10000; i++) (void)timer_get_cycles();
   gettimeofday(&tv, NULL);
-  timeCycles = __rdtsc() - timeCycles;
+  timeCycles = timer_get_cycles() - timeCycles;
   time += tv.tv_sec*1E6 + tv.tv_usec;
   freq = timeCycles/time;
 }
 static inline double gettime() {
   if (freq == -1) calibrate();
-  return __rdtsc()/freq;
+  return timer_get_cycles()/freq;
 }
 static inline double timer_cycles_per_us(void) {
   if (freq == -1) calibrate();

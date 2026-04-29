@@ -25,6 +25,7 @@ struct CIMState {
   float lw[CIM_MAX_QPS];
   uint64_t latency[CIM_MAX_QPS];
   uint64_t raw_latency[CIM_MAX_QPS];
+  uint32_t lat_bytes[CIM_MAX_QPS];
   unsigned int seed;
   int lw_initialized;
   uint16_t* qp_card;
@@ -41,6 +42,7 @@ void CIM_DebugLatPrinterStart(int interval_ms);
 void CIM_DebugLatPrinterStop(void);
 void CIM_DebugLatPrinterSetSource(const char* label, volatile uint64_t* lat, volatile uint64_t* r_lat, int nqps);
 void CIM_DebugLatPrinterSetWeightSource(const char* label, volatile float* lw, int nqps);
+void CIM_DebugLatPrinterSetByteSource(const char* label, volatile uint32_t* bytes, int nqps);
 void CIM_DebugLatPrinterSetSyncSeq(volatile uint32_t* seq);
 
 typedef struct {

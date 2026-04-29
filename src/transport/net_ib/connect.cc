@@ -20,6 +20,7 @@ NCCL_PARAM(IbSl, "IB_SL", -1);
 NCCL_PARAM(IbTc, "IB_TC", -1);
 NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", -1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
+NCCL_PARAM(OciLatPrintMs, "OCI_LAT_PRINT_MS", 0);
 
 enum ncclIbCommState {
   ncclIbCommStateStart = 0,
@@ -543,6 +544,7 @@ ncclResult_t ncclIbConnect(void* ctx, int dev, void* opaqueHandle, void** sendCo
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)stage->comm;
   int ready;
   uint8_t link_layer = IBV_LINK_LAYER_UNSPECIFIED;
+  bool useFrm = !!ncclParamOciFrmEnable();
   *sendComm = NULL;
 
   if (stage->state == ncclIbCommStateConnect)      goto ib_connect_check;
@@ -606,6 +608,9 @@ ib_recv_dev_list:
   localNqps  = ncclParamIbQpsPerConn() * comm->base.vProps.ndevs; // We must have at least 1 qp per-device
   remoteNqps = ncclParamIbQpsPerConn() * remoteVProps.ndevs;
   comm->base.nqps = remoteNqps > localNqps ? remoteNqps : localNqps; // Select max nqps (local or remote)
+  if (useFrm) {
+    NCCLCHECKGOTO(ncclIbSendCommInitMultiSendScratch(comm), ret, fail);
+  }
 
   comm->base.nDataQps = std::max(comm->base.vProps.ndevs, remoteVProps.ndevs);
 
@@ -762,6 +767,28 @@ ib_connect:
 
   NCCLCHECKGOTO(ncclIbSenderQpsToRts(comm, &remMeta), ret, fail);
 
+  if (useFrm) {
+    comm->cim = CIM_Start(comm->base.nqps);
+    if (comm->cim != NULL) {
+      for (int q = 0; q < comm->base.nqps; q++) {
+        comm->base.qps[q].sig_head = 0;
+        comm->base.qps[q].sig_tail = 0;
+        memset(comm->base.qps[q].sig_tsc, 0, sizeof(comm->base.qps[q].sig_tsc));
+        memset(comm->base.qps[q].sig_bytes, 0, sizeof(comm->base.qps[q].sig_bytes));
+        comm->base.frmFields.qp_lat[q] = 0;
+        comm->base.frmFields.qp_raw_lat[q] = 0;
+        comm->base.frmFields.qp_lat_bytes[q] = 0;
+        comm->base.frmFields.qp_zero_stamp_holdoff[q] = 0;
+      }
+
+      int ms = ncclParamOciLatPrintMs();
+      if (ms > 0) {
+        CIM_DebugLatPrinterStart(ms);
+      }
+    }
+    qpMapBuild(&comm->base);
+  }
+
   comm->base.ready = 1;
   stage->state = ncclIbCommStateConnected;
   stage->offset = 0;
@@ -776,6 +803,18 @@ exit:
   stage->state = ncclIbCommStateStart;
   return ret;
 fail:
+  if (comm != NULL) {
+    CIM_DebugLatPrinterSetWeightSource("lw", NULL, 0);
+    CIM_DebugLatPrinterSetSource("qp_lat", NULL, NULL, 0);
+    CIM_DebugLatPrinterSetByteSource("bytes", NULL, 0);
+    CIM_DebugLatPrinterSetSyncSeq(NULL);
+    CIM_DebugLatPrinterStop();
+    if (comm->cim != NULL) {
+      CIM_Stop(comm->cim);
+      comm->cim = NULL;
+    }
+    ncclIbSendCommFreeMultiSendScratch(comm);
+  }
   free(comm);
   goto exit;
 }
@@ -1238,6 +1277,16 @@ ncclResult_t ncclIbCloseSend(void* sendComm) {
     if (comm->base.resiliency) {
       NCCLCHECK(ncclIbResiliencyDestroy(&comm->base.resiliency));
     }
+    CIM_DebugLatPrinterSetWeightSource("lw", NULL, 0);
+    CIM_DebugLatPrinterSetSource("qp_lat", NULL, NULL, 0);
+    CIM_DebugLatPrinterSetByteSource("bytes", NULL, 0);
+    CIM_DebugLatPrinterSetSyncSeq(NULL);
+    CIM_DebugLatPrinterStop();
+    if (comm->cim != NULL) {
+      CIM_Stop(comm->cim);
+      comm->cim = NULL;
+    }
+    ncclIbSendCommFreeMultiSendScratch(comm);
     free(comm);
   }
   TIME_PRINT("IB");

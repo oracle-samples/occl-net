@@ -103,6 +103,9 @@ static volatile uint64_t* g_r_lat_ptr = NULL;
 static int g_lat_nqps = 0;
 static char g_lat_label[64] = "qp_lat";
 static char g_r_lat_label[64] = "raw_lat";
+static volatile uint32_t* g_bytes_ptr = NULL;
+static int g_bytes_nqps = 0;
+static char g_bytes_label[64] = "bytes";
 
 static volatile float* g_lw_ptr = NULL;
 static int g_lw_nqps = 0;
@@ -122,6 +125,8 @@ static void* lat_printer_thread(void* _) {
   memset(last, 0, sizeof(last));
   uint64_t last_raw[CIM_MAX_QPS];
   memset(last_raw, 0, sizeof(last_raw));
+  uint32_t last_bytes[CIM_MAX_QPS];
+  memset(last_bytes, 0, sizeof(last_bytes));
 
   float last_lw[CIM_MAX_QPS];
   for (int i = 0; i < CIM_MAX_QPS; i++) last_lw[i] = -1.0f;
@@ -135,9 +140,11 @@ static void* lat_printer_thread(void* _) {
 
     volatile uint64_t* lat = NULL;
     volatile uint64_t* rlat = NULL;
+    volatile uint32_t* bytes = NULL;
     int nqps = 0;
     char label[64];
     char rlabel[64];
+    char bytesLabel[64];
 
     volatile float* lw = NULL;
     int lw_nqps = 0;
@@ -147,13 +154,18 @@ static void* lat_printer_thread(void* _) {
     pthread_mutex_lock(&g_lat_mu);
     lat = g_lat_ptr;
     rlat = g_r_lat_ptr;
+    bytes = g_bytes_ptr;
     nqps = g_lat_nqps;
+    if (nqps == 0) nqps = g_bytes_nqps;
 
     strncpy(label, g_lat_label, sizeof(label));
     label[sizeof(label) - 1] = 0;
 
     strncpy(rlabel, g_r_lat_label, sizeof(rlabel));
     rlabel[sizeof(rlabel) - 1] = 0;
+
+    strncpy(bytesLabel, g_bytes_label, sizeof(bytesLabel));
+    bytesLabel[sizeof(bytesLabel) - 1] = 0;
 
     lw = g_lw_ptr;
     lw_nqps = g_lw_nqps;
@@ -163,7 +175,7 @@ static void* lat_printer_thread(void* _) {
     lwlabel[sizeof(lwlabel) - 1] = 0;
     pthread_mutex_unlock(&g_lat_mu);
 
-    if ((lat == NULL && rlat == NULL) || nqps <= 0) {
+    if ((lat == NULL && rlat == NULL && bytes == NULL) || nqps <= 0) {
       msleep(g_lat_interval_ms);
       continue;
     }
@@ -172,6 +184,7 @@ static void* lat_printer_thread(void* _) {
 
     uint64_t snap[CIM_MAX_QPS];
     uint64_t rsnap[CIM_MAX_QPS];
+    uint32_t bsnap[CIM_MAX_QPS];
     int changed = 0;
     while (1) {
       changed = 0;
@@ -197,6 +210,13 @@ static void* lat_printer_thread(void* _) {
           rsnap[i] = 0;
         }
 
+        if (bytes != NULL) {
+          bsnap[i] = __atomic_load_n(&bytes[i], __ATOMIC_RELAXED);
+          if (bsnap[i] != last_bytes[i]) changed = 1;
+        } else {
+          bsnap[i] = 0;
+        }
+
         if (lw != NULL && lw_nqps > 0) {
           float wv = load_float_relaxed(&lw[i]);
           float d = wv - last_lw[i];
@@ -212,20 +232,36 @@ static void* lat_printer_thread(void* _) {
 
     if (changed) {
       if (lw != NULL && lw_nqps > 0) {
-        if (lat != NULL && rlat != NULL) {
+        if (lat != NULL && rlat != NULL && bytes != NULL) {
+          fprintf(stdout, "%s/%s/%s/%s: ", label, rlabel, bytesLabel, lwlabel);
+        } else if (lat != NULL && rlat != NULL) {
           fprintf(stdout, "%s/%s/%s: ", label, rlabel, lwlabel);
+        } else if (lat != NULL && bytes != NULL) {
+          fprintf(stdout, "%s/%s/%s: ", label, bytesLabel, lwlabel);
         } else if (lat != NULL) {
           fprintf(stdout, "%s/%s: ", label, lwlabel);
-        } else {
+        } else if (rlat != NULL && bytes != NULL) {
+          fprintf(stdout, "%s/%s/%s: ", rlabel, bytesLabel, lwlabel);
+        } else if (rlat != NULL) {
           fprintf(stdout, "%s/%s: ", rlabel, lwlabel);
+        } else {
+          fprintf(stdout, "%s/%s: ", bytesLabel, lwlabel);
         }
       } else {
-        if (lat != NULL && rlat != NULL) {
+        if (lat != NULL && rlat != NULL && bytes != NULL) {
+          fprintf(stdout, "%s/%s/%s: ", label, rlabel, bytesLabel);
+        } else if (lat != NULL && rlat != NULL) {
           fprintf(stdout, "%s/%s: ", label, rlabel);
+        } else if (lat != NULL && bytes != NULL) {
+          fprintf(stdout, "%s/%s: ", label, bytesLabel);
         } else if (lat != NULL) {
           fprintf(stdout, "%s: ", label);
-        } else {
+        } else if (rlat != NULL && bytes != NULL) {
+          fprintf(stdout, "%s/%s: ", rlabel, bytesLabel);
+        } else if (rlat != NULL) {
           fprintf(stdout, "%s: ", rlabel);
+        } else {
+          fprintf(stdout, "%s: ", bytesLabel);
         }
       }
 
@@ -233,7 +269,17 @@ static void* lat_printer_thread(void* _) {
         float wv = 0.0f;
         if (lw != NULL && lw_nqps > 0) wv = load_float_relaxed(&lw[i]);
 
-        if (lat != NULL && rlat != NULL) {
+        if (lat != NULL && rlat != NULL && bytes != NULL) {
+          if (lw != NULL && lw_nqps > 0) {
+            fprintf(stdout, "q%d=%lu(raw=%lu,bytes=%u,w=%.4f) ", i, (unsigned long)snap[i], (unsigned long)rsnap[i], bsnap[i], wv);
+            last_lw[i] = wv;
+          } else {
+            fprintf(stdout, "q%d=%lu(raw=%lu,bytes=%u) ", i, (unsigned long)snap[i], (unsigned long)rsnap[i], bsnap[i]);
+          }
+          last[i] = snap[i];
+          last_raw[i] = rsnap[i];
+          last_bytes[i] = bsnap[i];
+        } else if (lat != NULL && rlat != NULL) {
           if (lw != NULL && lw_nqps > 0) {
             fprintf(stdout, "q%d=%lu(raw=%lu,w=%.4f) ", i, (unsigned long)snap[i], (unsigned long)rsnap[i], wv);
             last_lw[i] = wv;
@@ -242,6 +288,15 @@ static void* lat_printer_thread(void* _) {
           }
           last[i] = snap[i];
           last_raw[i] = rsnap[i];
+        } else if (lat != NULL && bytes != NULL) {
+          if (lw != NULL && lw_nqps > 0) {
+            fprintf(stdout, "q%d=%lu(bytes=%u,w=%.4f) ", i, (unsigned long)snap[i], bsnap[i], wv);
+            last_lw[i] = wv;
+          } else {
+            fprintf(stdout, "q%d=%lu(bytes=%u) ", i, (unsigned long)snap[i], bsnap[i]);
+          }
+          last[i] = snap[i];
+          last_bytes[i] = bsnap[i];
         } else if (lat != NULL) {
           if (lw != NULL && lw_nqps > 0) {
             fprintf(stdout, "q%d=%lu(w=%.4f) ", i, (unsigned long)snap[i], wv);
@@ -250,7 +305,16 @@ static void* lat_printer_thread(void* _) {
             fprintf(stdout, "q%d=%lu ", i, (unsigned long)snap[i]);
           }
           last[i] = snap[i];
-        } else {
+        } else if (rlat != NULL && bytes != NULL) {
+          if (lw != NULL && lw_nqps > 0) {
+            fprintf(stdout, "q%d=%lu(bytes=%u,w=%.4f) ", i, (unsigned long)rsnap[i], bsnap[i], wv);
+            last_lw[i] = wv;
+          } else {
+            fprintf(stdout, "q%d=%lu(bytes=%u) ", i, (unsigned long)rsnap[i], bsnap[i]);
+          }
+          last_raw[i] = rsnap[i];
+          last_bytes[i] = bsnap[i];
+        } else if (rlat != NULL) {
           if (lw != NULL && lw_nqps > 0) {
             fprintf(stdout, "q%d=%lu(w=%.4f) ", i, (unsigned long)rsnap[i], wv);
             last_lw[i] = wv;
@@ -258,6 +322,14 @@ static void* lat_printer_thread(void* _) {
             fprintf(stdout, "q%d=%lu ", i, (unsigned long)rsnap[i]);
           }
           last_raw[i] = rsnap[i];
+        } else {
+          if (lw != NULL && lw_nqps > 0) {
+            fprintf(stdout, "q%d=%u(w=%.4f) ", i, bsnap[i], wv);
+            last_lw[i] = wv;
+          } else {
+            fprintf(stdout, "q%d=%u ", i, bsnap[i]);
+          }
+          last_bytes[i] = bsnap[i];
         }
       }
 
@@ -309,6 +381,8 @@ void CIM_DebugLatPrinterStop(void) {
   g_lat_ptr = NULL;
   g_r_lat_ptr = NULL;
   g_lat_nqps = 0;
+  g_bytes_ptr = NULL;
+  g_bytes_nqps = 0;
   g_lw_ptr = NULL;
   g_lw_nqps = 0;
   g_dbg_seq_ptr = NULL;
@@ -352,6 +426,23 @@ void CIM_DebugLatPrinterSetWeightSource(const char* label, volatile float* lw, i
   } else {
     strncpy(g_lw_label, "lw", sizeof(g_lw_label));
     g_lw_label[sizeof(g_lw_label) - 1] = 0;
+  }
+
+  pthread_mutex_unlock(&g_lat_mu);
+}
+
+void CIM_DebugLatPrinterSetByteSource(const char* label, volatile uint32_t* bytes, int nqps) {
+  pthread_mutex_lock(&g_lat_mu);
+
+  g_bytes_ptr = bytes;
+  g_bytes_nqps = nqps;
+
+  if (label != NULL && label[0] != 0) {
+    strncpy(g_bytes_label, label, sizeof(g_bytes_label));
+    g_bytes_label[sizeof(g_bytes_label) - 1] = 0;
+  } else {
+    strncpy(g_bytes_label, "bytes", sizeof(g_bytes_label));
+    g_bytes_label[sizeof(g_bytes_label) - 1] = 0;
   }
 
   pthread_mutex_unlock(&g_lat_mu);
