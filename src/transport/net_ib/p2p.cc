@@ -94,6 +94,7 @@ static inline void ibFrmFlushTelemetry(struct ncclIbSendComm* comm) {
 static inline bool ibFrmGateUpdate(struct ncclIbSendComm* comm) {
   bool enabled = ncclParamOciFrmEnable() &&
       comm != NULL &&
+      comm->base.resiliency == NULL &&
       comm->base.nqps > 0 &&
       comm->cim != NULL &&
       comm->multiSendScratch.storage != NULL &&
