@@ -13,6 +13,7 @@ NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
 NCCL_PARAM(OciFrmEnable, "OCI_FRM_ENABLE", 0);
 
 double g_inv_cyc_per_us = 0.0;
+bool g_ncclIbUseCim = false;
 
 static std::mutex ncclIbMutex;
 
@@ -396,6 +397,7 @@ fail:
 ncclResult_t ncclIbInit(void** ctx, uint64_t commId, ncclNetCommConfig_t* config, ncclDebugLogger_t logFunction, ncclProfilerCallback_t profFunction) {
   ncclResult_t ret = ncclSuccess;
   ncclNetCommConfig_t* netCommConfig = nullptr;
+  g_ncclIbUseCim = !!ncclParamOciFrmEnable();
   NCCLCHECK(ncclIbInitDevices(logFunction, profFunction));
   NCCLCHECK(ncclCalloc(&netCommConfig, 1));
   netCommConfig->trafficClass = config->trafficClass;

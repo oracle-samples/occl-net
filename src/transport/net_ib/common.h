@@ -642,19 +642,17 @@ ncclResult_t ncclIbFinalize(void* ctx);
 ncclResult_t ncclIbSetNetAttr(void *ctx, ncclNetAttr_t *netAttr);
 
 static inline uint32_t qpHash32(uint32_t x) {
+  // Fold upper bits into the low bits we keep after QP_MAP_MASK, then use one multiply.
   x ^= x >> 16;
-  x *= 0x7feb352dU;
-  x ^= x >> 15;
-  x *= 0x846ca68bU;
-  x ^= x >> 16;
-  return x;
+  return x * 0x9e3779b1U;
 }
-
 static inline void qpMapClear(ncclIbQpNumHash* m) {
   memset(m->keys, 0, sizeof(m->keys));
+  // vals can be left uninitialized; keys==0 denotes empty.
 }
 
 static inline void qpMapInsert(ncclIbQpNumHash* m, uint32_t qp_num, uint16_t qpIndex) {
+  // qp_num should never be 0; if it is, shift it to 1.
   if (qp_num == 0) qp_num = 1;
 
   uint32_t h = qpHash32(qp_num) & QP_MAP_MASK;
@@ -663,21 +661,31 @@ static inline void qpMapInsert(ncclIbQpNumHash* m, uint32_t qp_num, uint16_t qpI
     if (k == 0 || k == qp_num) {
       m->keys[h] = qp_num;
       m->vals[h] = qpIndex;
+    #if FRM_DEBUG
+      fprintf(stdout, "inserted this qp_num=%u for qp_index=%d\n", qp_num, qpIndex);
+      fflush(stdout);
+    #endif
       return;
     }
-    h = (h + 1) & QP_MAP_MASK;
+    h = (h + 1) & QP_MAP_MASK; // linear probing
   }
+
+  // If you ever hit this, table is too small or someone inserted garbage.
+  // In NCCL plugin style, you could WARN() + abort/return error from init.
 }
 
 static inline int qpMapFind(const ncclIbQpNumHash* m, uint32_t qp_num) {
   if (qp_num == 0) qp_num = 1;
-
   uint32_t h = qpHash32(qp_num) & QP_MAP_MASK;
-  for (uint32_t probes = 0; probes < QP_MAP_SIZE; probes++) {
-    uint32_t k = m->keys[h];
-    if (k == 0) return -1;
-    if (k == qp_num) return (int)m->vals[h];
+  uint32_t k = m->keys[h];
+  if (k == qp_num) return (int)m->vals[h];
+  if (k == 0) return -1;
+
+  for (uint32_t probes = 1; probes < QP_MAP_SIZE; probes++) {
     h = (h + 1) & QP_MAP_MASK;
+    k = m->keys[h];
+    if (k == qp_num) return (int)m->vals[h];
+    if (k == 0) return -1;
   }
   return -1;
 }
@@ -685,13 +693,26 @@ static inline int qpMapFind(const ncclIbQpNumHash* m, uint32_t qp_num) {
 static inline void qpMapBuild(ncclIbNetCommBase* base) {
   if (base == NULL) return;
   qpMapClear(&base->frmFields.qpHash);
+#if FRM_DEBUG
+  fprintf(stdout,"Building qmap\n");
+  fflush(stdout);
+#endif
   for (int i = 0; i < base->nqps; i++) {
     if (base->qps[i].qp == NULL) continue;
-    qpMapInsert(&base->frmFields.qpHash, base->qps[i].qp->qp_num, (uint16_t)i);
+    uint32_t qp_num = base->qps[i].qp->qp_num;
+    qpMapInsert(&base->frmFields.qpHash, qp_num, (uint16_t)i);
   }
 }
 
 int64_t ncclParamOciFrmEnable();
+int64_t ncclParamIbSplitDataOnQps();
+extern bool g_ncclIbUseCim;
+/**
+ * Cached conversion factor: cycles -> microseconds (hot path).
+ *
+ * IMPORTANT: must have external linkage (single global) so init.cc can
+ * initialize it once and p2p.cc can read it.
+ */
 extern double g_inv_cyc_per_us;
 
 #endif
