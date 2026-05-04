@@ -72,10 +72,8 @@ static inline void ibFrmFlushTelemetry(struct ncclIbSendComm* comm) {
   for (int qpIndex = 0; qpIndex < comm->base.nqps; qpIndex++) {
     ncclIbQp* qp = &comm->base.qps[qpIndex];
     qp->sig_tail = qp->sig_head;
-    qp->sig_req_tail = qp->sig_head;
     memset(qp->sig_tsc, 0, sizeof(qp->sig_tsc));
     memset(qp->sig_bytes, 0, sizeof(qp->sig_bytes));
-    memset(qp->sig_req, 0, sizeof(qp->sig_req));
   }
 
   if (comm->cim != NULL) {
@@ -154,20 +152,15 @@ static inline void ibFrmComputeLw(struct ncclIbSendComm* comm, int nqps, float* 
 
 static_assert((QP_SIG_RING & (QP_SIG_RING - 1)) == 0, "QP_SIG_RING must be a power of two");
 
-static inline void ibQpSigPush(ncclIbQp* qp, struct ncclIbRequest* req, uint64_t tsc, uint32_t bytes) {
+static inline void ibQpSigPush(ncclIbQp* qp, uint64_t tsc, uint32_t bytes) {
   uint32_t head = qp->sig_head;
   uint32_t tail = qp->sig_tail;
-  uint32_t req_tail = qp->sig_req_tail;
   if (__builtin_expect((head - tail) >= QP_SIG_RING, 0)) {
     qp->sig_tail = tail + 1;
-  }
-  if (__builtin_expect((head - req_tail) >= QP_SIG_RING, 0)) {
-    qp->sig_req_tail = req_tail + 1;
   }
   const uint32_t slot = head & (QP_SIG_RING - 1u);
   qp->sig_tsc[slot] = tsc;
   qp->sig_bytes[slot] = bytes;
-  qp->sig_req[slot] = req;
   qp->sig_head = head + 1;
 }
 
@@ -178,16 +171,6 @@ static inline int ibQpSigPop(ncclIbQp* qp, uint64_t* out_t0, uint32_t* out_bytes
   *out_t0 = qp->sig_tsc[slot];
   *out_bytes = qp->sig_bytes[slot];
   qp->sig_tail = tail + 1;
-  return 1;
-}
-
-static inline int ibQpSigPopReq(ncclIbQp* qp, struct ncclIbRequest** out_req) {
-  const uint32_t tail = qp->sig_req_tail;
-  if (__builtin_expect(tail == qp->sig_head, 0)) return 0;
-  const uint32_t slot = tail & (QP_SIG_RING - 1u);
-  *out_req = qp->sig_req[slot];
-  qp->sig_req[slot] = NULL;
-  qp->sig_req_tail = tail + 1;
   return 1;
 }
 
@@ -862,7 +845,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
         &postWrs[0] :
         ((scratch->chainBytesPerPost[p] == 0) ? postImmWr : &postWrs[0]);
 
-    ibQpSigPush(qp, reqs[0], spt0, scratch->chainBytesPerPost[p]);
+    ibQpSigPush(qp, spt0, scratch->chainBytesPerPost[p]);
     NCCLCHECK(wrap_ibv_post_send(qp->qp, postHeadWr, &bad_wr));
 
     if (trackResiliency) {
@@ -1215,25 +1198,10 @@ static int getReqQpIndex(struct ncclIbRequest* req, int request, int qpNumber) {
 }
 #endif
 
-static inline struct ncclIbRequest* ibSendReqPopByQp(struct ncclIbSendComm* sendComm, uint32_t qpNum, int devIndex) {
-  if (sendComm == NULL || !sendComm->frmGateOpen) return NULL;
-  // Under resiliency, keep send completion ownership with the baseline wr_id
-  // path. FRM still uses the QP signal ring for latency stamps.
-  if (sendComm->base.resiliency != NULL) return NULL;
-
-  ncclIbQp* qp = NULL;
-  if (ncclIbCommBaseGetQpByQpNum(&sendComm->base, devIndex, qpNum, &qp, NULL) != ncclSuccess || qp == NULL) {
-    return NULL;
-  }
-
-  struct ncclIbRequest* req = NULL;
-  if (!ibQpSigPopReq(qp, &req)) return NULL;
-  return req;
-}
-
 static inline ncclResult_t ncclIbRequestRetrieveFromCompletion(struct ncclIbNetCommBase* base, ibv_wc* wc, int devIndex, ncclIbRequest** req) {
   assert(req != NULL);
   assert(wc != NULL);
+  (void)devIndex;
 
   // In case of a completion with error, there is no guarantee that all fields
   // of the completion are valid.
@@ -1256,8 +1224,7 @@ static inline ncclResult_t ncclIbRequestRetrieveFromCompletion(struct ncclIbNetC
     *req = ibRecvReqFind(recvComm, ibReqWrIdDecode(wc->wr_id));
   } else if (base->isSend) {
     struct ncclIbSendComm* sendComm = (struct ncclIbSendComm*)base;
-    *req = ibSendReqPopByQp(sendComm, wc->qp_num, devIndex);
-    if (*req == NULL) *req = ibSendReqFindByWrId(sendComm, wc->wr_id);
+    *req = ibSendReqFindByWrId(sendComm, wc->wr_id);
   } else {
     *req = NULL;
   }

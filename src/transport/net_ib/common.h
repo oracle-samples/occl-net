@@ -266,12 +266,12 @@ struct alignas(128) ncclIbQp {
   // The index of the device on the remote side to which this QP is connected
   // to.
   int remDevIdx;
+  // FRM completion ordering keeps only timestamp and byte-count state here.
+  // Request recovery for send CQEs now comes uniformly from wr_id lookup.
   uint32_t sig_head;
   uint32_t sig_tail;
   uint64_t sig_tsc[QP_SIG_RING];
   uint32_t sig_bytes[QP_SIG_RING];
-  uint32_t sig_req_tail;
-  struct ncclIbRequest* sig_req[QP_SIG_RING];
   // Cached local QP attributes used to restore INIT state during rejoin.
   unsigned int accessFlags;
   // Remote QP number paired with this local QP.
@@ -287,6 +287,7 @@ static_assert((sizeof(struct ncclIbQp) % 128) == 0, "ncclIbQp size must be a 128
 static_assert(offsetof(struct ncclIbQp, qp) == 0, "ncclIbQp::qp offset changed");
 static_assert(offsetof(struct ncclIbQp, sig_tsc) == 24, "ncclIbQp::sig_tsc should stay in the first 128B region");
 static_assert(offsetof(struct ncclIbQp, sig_bytes) == 88, "ncclIbQp::sig_bytes should stay in the first 128B region");
+static_assert(offsetof(struct ncclIbQp, accessFlags) == 120, "ncclIbQp::accessFlags should stay in the first 128B region");
 
 // We need to support NCCL_NET_MAX_REQUESTS for each concurrent receive
 #define NET_IB_MAX_REQUESTS (NCCL_NET_MAX_REQUESTS*NCCL_NET_IB_MAX_RECVS)
