@@ -493,7 +493,15 @@ static ncclResult_t ibMultiSendBaseline(struct ncclIbSendComm* comm, int slot) {
   return ncclSuccess;
 }
 
-static ncclResult_t ibMultiSendFrmResiliency(struct ncclIbSendComm* comm, int slot) {
+// FRM-only and FRM+resiliency share the same sender-side planner so the
+// resilient path benefits from the staged scratch builder as well. This helper
+// intentionally stops at send planning/posting:
+// - replay and failover policy still live in the resiliency code
+// - send completion ownership under resiliency still stays on the baseline
+//   wr_id lookup path
+// - already-delivered logical lanes must still advance the shadow offsets
+//   before the post is skipped so replay bookkeeping remains stable
+static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bool trackResiliency) {
   static int g_lat_src_set = 0;
 
   struct ncclIbRequest** reqs = comm->sendReqs[slot];
@@ -506,251 +514,9 @@ static ncclResult_t ibMultiSendFrmResiliency(struct ncclIbSendComm* comm, int sl
     return ibMultiSendBaseline(comm, slot);
   }
 
-  TRACE(NCCL_NET, "NET/IB: %s: Posting FRM+resiliency send request (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d)",
-        __func__, reqs[0], reqs[0]->base, reqs[0]->id, slot, nreqs);
-
-  const int nqps = ncclIbCommBaseGetNqpsPerRequest(&comm->base);
-  const bool split = comm->base.splitDataOnQps == 1;
-  const int activeBaseIx = reqs[0]->id % comm->base.nqps;
-  const bool dbgLatEnabled = (comm->cim != NULL) && (FRM_LAT_PRINT_MS > 0);
-  const bool captureRawLat = (FRM_LAT_PRINT_MS > 0);
-  uint8_t attemptOrder[NCCL_IB_MAX_QPS] = {0};
-
-  for (int r = 0; r < nreqs; r++) {
-    memset(reqs[r]->send.lastAttemptQpIndex, 0xff, sizeof(reqs[r]->send.lastAttemptQpIndex));
-    memset(reqs[r]->send.lastAttemptOrder, 0, sizeof(reqs[r]->send.lastAttemptOrder));
-  }
-
-  float* lwArr = scratch->lwPerQp;
-  bool bypassEqual = false;
-  {
-    uint64_t minLat = UINT64_MAX;
-    uint64_t maxLat = 0;
-    const int count = split ? nqps : comm->base.nDataQps;
-    for (int i = 0; i < count; i++) {
-      int q = split ? i : ((activeBaseIx + i) % comm->base.nqps);
-      uint64_t v = comm->base.frmFields.qp_lat[q];
-      if (v == 0) continue;
-      if (v < minLat) minLat = v;
-      if (v > maxLat) maxLat = v;
-    }
-    if (minLat == UINT64_MAX || (maxLat - minLat) <= ibFrmSpreadEpsUs()) {
-      bypassEqual = true;
-    }
-  }
-  const bool useFrmNow = !bypassEqual;
-
-  if (useFrmNow) {
-    ibFrmComputeLw(comm, nqps, lwArr, split, activeBaseIx);
-  } else {
-    const float eq = 1.0f / (float)nqps;
-    for (int q = 0; q < nqps; q++) lwArr[q] = eq;
-  }
-
-  const uint64_t wr_id = reqs[0]->send.wrIdToken;
-  assert(wr_id != 0);
-  for (int r = 0; r < nreqs; r++) {
-    struct ibv_send_wr* wr = comm->wrs + r;
-    memset(wr, 0, sizeof(struct ibv_send_wr));
-
-    struct ibv_sge* sge = comm->sges + r;
-    sge->addr = (uintptr_t)reqs[r]->send.data;
-    sge->length = 0;
-    wr->opcode = IBV_WR_RDMA_WRITE;
-    wr->send_flags = 0;
-    wr->wr.rdma.remote_addr = slots[r].addr;
-    wr->next = wr + 1;
-    wr->wr_id = wr_id;
-    wr->sg_list = sge;
-    wr->num_sge = 1;
-#ifdef NCCL_ENABLE_NET_PROFILING
-    reqs[r]->pInfo[0].nEventHandles = 0;
-#endif
-    if (useFrmNow) {
-      ibFrmComputeChunksAll(lwArr, nqps, reqs[r]->send.size, kIbMultiSendAlign,
-                            ncclIbMultiSendScratchChunkRow(scratch, r));
-    } else {
-      scratch->equalChunkSize[r] =
-          DIVUP(DIVUP(reqs[r]->send.size, nqps), kIbMultiSendAlign) * kIbMultiSendAlign;
-    }
-  }
-
-  const uint32_t immData = ncclParamIbReceiverSideMatchingScheme() == BY_ID ?
-      (uint32_t)(reqs[0]->id % UINT32_MAX) : reqs[0]->send.size;
-  struct ibv_send_wr* lastWr = comm->wrs + nreqs - 1;
-  if (nreqs > 1 || (comm->ar && reqs[0]->send.size > ncclParamIbArThreshold())) {
-    lastWr++;
-    memset(lastWr, 0, sizeof(struct ibv_send_wr));
-    if (nreqs > 1) {
-      lastWr->wr.rdma.remote_addr =
-          comm->remCmplsRecords.addr + slot * sizeof(struct ncclIbRequestCompletionRecord);
-      lastWr->num_sge = 1;
-    }
-  }
-  lastWr->wr_id = wr_id;
-  lastWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-  lastWr->imm_data = htobe32(immData);
-  lastWr->next = NULL;
-  lastWr->send_flags = IBV_SEND_SIGNALED;
-
-  uint32_t sendOffsets[NCCL_NET_IB_MAX_RECVS] = {0};
-  uint64_t spt0 = timer_get_cycles();
-  if (dbgLatEnabled) {
-    (void)__atomic_add_fetch(&comm->cim->dbg_seq, 1u, __ATOMIC_RELEASE);
-  }
-
-  for (int i = 0; i < nqps; i++) {
-    int logicalQpIndex = -1;
-    ncclIbQp* qp = NULL;
-    NCCLCHECK(ncclIbCommBaseGetQpForRequest(&comm->base, reqs[0]->id, i, &qp, &logicalQpIndex));
-
-    TRACE(NCCL_NET, "NET/IB: %s: Posting FRM+resiliency send (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d, wr_id=%ld) on QP (qp_num=%u, devIndex=%d, logicalQpIndex=%d)",
-          __func__, reqs[0], reqs[0]->base, reqs[0]->id, slot, nreqs, wr_id, qp->qp->qp_num, qp->devIndex, logicalQpIndex);
-
-    size_t plannedChainBytes = 0;
-    for (int r = 0; r < nreqs; r++) {
-      size_t remaining = (size_t)(reqs[r]->send.size - sendOffsets[r]);
-      size_t cs = !useFrmNow ?
-          (size_t)scratch->equalChunkSize[r] :
-          ncclIbMultiSendScratchChunkRow(scratch, r)[split ? logicalQpIndex : i];
-      if (cs > remaining) cs = remaining;
-      plannedChainBytes += cs;
-    }
-
-    if (reqs[0]->send.pendingData[logicalQpIndex] == false) {
-      for (int r = 0; r < nreqs; r++) {
-        size_t remaining = (size_t)(reqs[r]->send.size - sendOffsets[r]);
-        size_t cs = !useFrmNow ?
-            (size_t)scratch->equalChunkSize[r] :
-            ncclIbMultiSendScratchChunkRow(scratch, r)[split ? logicalQpIndex : i];
-        if (cs > remaining) cs = remaining;
-        const uint32_t advance = (uint32_t)cs;
-        sendOffsets[r] = std::min<uint32_t>(sendOffsets[r] + advance, reqs[r]->send.size);
-        comm->wrs[r].sg_list->addr += advance;
-        comm->wrs[r].wr.rdma.remote_addr += advance;
-      }
-      TRACE(NCCL_NET, "NET/IB: %s: Skipping logical QP index %d (req=%p, slot=%d) as it was already delivered.",
-            __func__, logicalQpIndex, reqs[0], slot);
-      continue;
-    }
-
-    int devIndex = qp->devIndex;
-    int physicalQpIndex = qp - comm->base.qps;
-    assert(physicalQpIndex >= 0 && physicalQpIndex < comm->base.nqps);
-
-    for (int r = 0; r < nreqs; r++) {
-      comm->wrs[r].wr.rdma.rkey = slots[r].rkeys[qp->remDevIdx];
-
-      size_t remaining = (size_t)(reqs[r]->send.size - sendOffsets[r]);
-      size_t cs = !useFrmNow ?
-          (size_t)scratch->equalChunkSize[r] :
-          ncclIbMultiSendScratchChunkRow(scratch, r)[split ? logicalQpIndex : i];
-      if (cs > remaining) cs = remaining;
-      const int length = (int)cs;
-      comm->wrs[r].sg_list->length = length;
-      if (length == 0) {
-        comm->wrs[r].num_sge = 0;
-      } else {
-        comm->wrs[r].sg_list->lkey = reqs[r]->send.lkeys[devIndex];
-        comm->wrs[r].num_sge = 1;
-      }
-    }
-
-    if (nreqs > 1) {
-      lastWr->sg_list = &(comm->devs[devIndex].sge);
-      lastWr->sg_list[0].addr = (uint64_t)(comm->remCmplsRecords.elems[slot]);
-      lastWr->sg_list[0].length = nreqs * sizeof(int);
-      lastWr->wr.rdma.rkey = comm->remCmplsRecords.rkeys[devIndex];
-    }
-
-#ifdef NCCL_ENABLE_NET_PROFILING
-    for (int r = 0; r < nreqs; r++) {
-      int nEventHandles = reqs[r]->pInfo[0].nEventHandles;
-      assert(nEventHandles < MAX_QPS_PER_REQ);
-      reqs[r]->pInfo[0].qpIndex[nEventHandles] = logicalQpIndex;
-      int64_t pluginId = NCCL_PROFILER_NET_TYPE_IB | NCCL_PROFILER_NET_IB_VER;
-      reqs[r]->pInfo[0].data.type = ncclProfileQp;
-      reqs[r]->pInfo[0].data.qp.device = devIndex;
-      reqs[r]->pInfo[0].data.qp.wr_id = comm->wrs[r].wr_id;
-      reqs[r]->pInfo[0].data.qp.opcode = comm->wrs[r].opcode;
-      reqs[r]->pInfo[0].data.qp.qpNum = qp->qp->qp_num;
-      reqs[r]->pInfo[0].data.qp.length = comm->sges[r].length;
-      void* pHandle = reqs[r]->pInfo[0].pHandle;
-      NCCLCHECK(ncclProfilerFunction(&reqs[r]->pInfo[0].qpEventHandles[nEventHandles],
-                                     ncclProfilerNetEventStart, pHandle, pluginId,
-                                     &reqs[r]->pInfo[0].data));
-      reqs[r]->pInfo[0].nEventHandles++;
-    }
-#endif
-
-    if (dbgLatEnabled) {
-      const float postLw = split ? lwArr[logicalQpIndex] : lwArr[i];
-      comm->cim->lw[logicalQpIndex] = postLw;
-      comm->cim->latency[logicalQpIndex] = comm->base.frmFields.qp_lat[logicalQpIndex];
-      comm->cim->raw_latency[logicalQpIndex] = comm->base.frmFields.qp_raw_lat[logicalQpIndex];
-      comm->cim->lat_bytes[logicalQpIndex] = comm->base.frmFields.qp_lat_bytes[logicalQpIndex];
-    }
-
-    ibQpSigPush(qp, reqs[0], spt0, (uint32_t)std::min<size_t>(plannedChainBytes, UINT32_MAX));
-
-    struct ibv_send_wr* bad_wr = NULL;
-    NCCLCHECK(wrap_ibv_post_send(qp->qp, comm->wrs, &bad_wr));
-
-    for (int r = 0; r < nreqs; r++) {
-      reqs[r]->send.lastAttemptQpIndex[logicalQpIndex] = physicalQpIndex;
-      reqs[r]->send.lastAttemptOrder[logicalQpIndex] = attemptOrder[physicalQpIndex];
-      reqs[r]->send.pendingData[logicalQpIndex] = true;
-    }
-    attemptOrder[physicalQpIndex]++;
-
-    for (int r = 0; r < nreqs; r++) {
-      const uint32_t advance = (uint32_t)comm->wrs[r].sg_list->length;
-      sendOffsets[r] = std::min<uint32_t>(sendOffsets[r] + advance, reqs[r]->send.size);
-      comm->wrs[r].sg_list->addr += advance;
-      comm->wrs[r].wr.rdma.remote_addr += advance;
-      TRACE(NCCL_NET, "NET/IB: %s: Send request (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d, reqIdx=%d, wr_id=%ld) posted %d bytes on logical QP index %d via physical QP index %d (devIndex=%d, qp_num=%u), total posted %d/%d bytes",
-            __func__, reqs[r], reqs[0]->base, reqs[r]->id, slot, nreqs, r, comm->wrs[r].wr_id,
-            comm->wrs[r].sg_list->length, logicalQpIndex, physicalQpIndex, devIndex, qp->qp->qp_num,
-            sendOffsets[r], reqs[r]->send.size);
-    }
-  }
-
-  if (dbgLatEnabled) {
-    (void)__atomic_add_fetch(&comm->cim->dbg_seq, 1u, __ATOMIC_RELEASE);
-  }
-
-  if (dbgLatEnabled && !g_lat_src_set) {
-    g_lat_src_set = 1;
-    CIM_DebugLatPrinterSetWeightSource("lw", (volatile float*)comm->cim->lw, comm->base.nqps);
-    CIM_DebugLatPrinterSetSource("qp_lat(us)", (volatile uint64_t*)comm->cim->latency,
-                                 (volatile uint64_t*)comm->cim->raw_latency, comm->base.nqps);
-    CIM_DebugLatPrinterSetByteSource("bytes", (volatile uint32_t*)comm->cim->lat_bytes, comm->base.nqps);
-    CIM_DebugLatPrinterSetSyncSeq(&comm->cim->dbg_seq);
-  }
-
-  (void)captureRawLat;
-  return ncclSuccess;
-}
-
-ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
-  static int g_lat_src_set = 0;
-
-  if (!ibFrmEnabledForSend(comm)) return ibMultiSendBaseline(comm, slot);
-  if (comm->base.resiliency != NULL) return ibMultiSendFrmResiliency(comm, slot);
-  //fprintf(stdout,"In FRM Multisend");
-  //fflush(stdout);
-  struct ncclIbRequest** reqs = comm->sendReqs[slot];
-  volatile struct ncclIbSendFifo* slots = comm->ctsFifo[slot];
-  int nreqs = slots[0].nreqs;
-  if (nreqs > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
-
-  struct ncclIbMultiSendScratch* scratch = &comm->multiSendScratch;
-  if (scratch->storage == NULL || scratch->nqps < comm->base.nqps) {
-    return ibMultiSendBaseline(comm, slot);
-  }
-
-  TRACE(NCCL_NET, "NET/IB: %s: Posting FRM send request (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d)",
-        __func__, reqs[0], reqs[0]->base, reqs[0]->id, slot, nreqs);
+  const char* traceMode = trackResiliency ? "FRM+resiliency" : "FRM";
+  TRACE(NCCL_NET, "NET/IB: %s: Posting %s send request (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d)",
+        __func__, traceMode, reqs[0], reqs[0]->base, reqs[0]->id, slot, nreqs);
 
   const int nqps = ncclIbCommBaseGetNqpsPerRequest(&comm->base);
   const bool split = comm->base.splitDataOnQps == 1;
@@ -762,7 +528,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   int requestOrderByPost[NCCL_IB_MAX_QPS] = {0};
 #endif
 
-  if (comm->base.resiliency) {
+  if (trackResiliency) {
     for (int r = 0; r < nreqs; r++) {
       memset(reqs[r]->send.lastAttemptQpIndex, 0xff, sizeof(reqs[r]->send.lastAttemptQpIndex));
       memset(reqs[r]->send.lastAttemptOrder, 0, sizeof(reqs[r]->send.lastAttemptOrder));
@@ -805,7 +571,8 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       ibFrmComputeChunksAll(lwArr, nqps, reqs[r]->send.size, kIbMultiSendAlign,
                             ncclIbMultiSendScratchChunkRow(scratch, r));
     } else {
-      scratch->equalChunkSize[r] = DIVUP(DIVUP(reqs[r]->send.size, nqps), kIbMultiSendAlign) * kIbMultiSendAlign;
+      scratch->equalChunkSize[r] =
+          DIVUP(DIVUP(reqs[r]->send.size, nqps), kIbMultiSendAlign) * kIbMultiSendAlign;
     }
     scratch->reqOffsetShadow[r] = 0;
     scratch->sgeAddrShadow[r] = (uintptr_t)reqs[r]->send.data;
@@ -816,7 +583,8 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       (uint32_t)(reqs[0]->id % UINT32_MAX) : reqs[0]->send.size;
   const uint32_t immDataBe = htobe32(immData);
   const bool needImmWr = (nreqs > 1) || (comm->ar && reqs[0]->send.size > ncclParamIbArThreshold());
-  const uint64_t remSizesRemoteAddr = comm->remCmplsRecords.addr + slot*sizeof(struct ncclIbRequestCompletionRecord);
+  const uint64_t remSizesRemoteAddr =
+      comm->remCmplsRecords.addr + slot * sizeof(struct ncclIbRequestCompletionRecord);
   if (nreqs > 1) {
     int* sizes = comm->remCmplsRecords.elems[slot];
     for (int r = 0; r < nreqs; r++) sizes[r] = reqs[r]->send.size;
@@ -852,7 +620,10 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       sgeAddr += sendSz;
       remoteAddr += sendSz;
 
-      if (comm->base.resiliency && req->send.pendingData[logicalQpIndex] == false) {
+      const bool skipDelivered = trackResiliency && req->send.pendingData[logicalQpIndex] == false;
+      if (skipDelivered) {
+        TRACE(NCCL_NET, "NET/IB: %s: Skipping logical QP index %d (req=%p, slot=%d) as it was already delivered.",
+              __func__, logicalQpIndex, req, slot);
         continue;
       }
 
@@ -945,7 +716,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       int physicalQpIndex = qp - comm->base.qps;
       assert(physicalQpIndex >= 0 && physicalQpIndex < comm->base.nqps);
 
-      const bool skipPost = comm->base.resiliency && reqs[0]->send.pendingData[logicalQpIndex] == false;
+      const bool skipDelivered = trackResiliency && reqs[0]->send.pendingData[logicalQpIndex] == false;
       struct ibv_send_wr* postWrs = ncclIbMultiSendScratchWrRow(scratch, postCount);
       struct ibv_sge* postSges = ncclIbMultiSendScratchSgeRow(scratch, postCount);
       struct ibv_send_wr* postImmWr = &postWrs[NCCL_NET_IB_MAX_RECVS];
@@ -973,7 +744,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
         scratch->sgeAddrShadow[r] += sendSz;
         scratch->remoteAddrShadow[r] += sendSz;
 
-        if (skipPost) continue;
+        if (skipDelivered) continue;
 
         sendSzRow[r] = sendSz;
         chainBytes += sendSz;
@@ -1002,6 +773,12 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
         lastDataWr = postWr;
       }
 
+      if (skipDelivered) {
+        TRACE(NCCL_NET, "NET/IB: %s: Skipping logical QP index %d (req=%p, slot=%d) as it was already delivered.",
+              __func__, logicalQpIndex, reqs[0], slot);
+        continue;
+      }
+
       scratch->qpPerPost[postCount] = qp;
       scratch->qpIndexPerPost[postCount] = logicalQpIndex;
       physicalQpIndexByPost[postCount] = physicalQpIndex;
@@ -1019,7 +796,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       postImmWr->sg_list = &(comm->devs[qp->devIndex].sge);
       postImmWr->num_sge = 1;
       postImmWr->sg_list[0].addr = (uint64_t)(comm->remCmplsRecords.elems[slot]);
-      postImmWr->sg_list[0].length = nreqs*sizeof(int);
+      postImmWr->sg_list[0].length = nreqs * sizeof(int);
       postImmWr->wr.rdma.rkey = comm->remCmplsRecords.rkeys[qp->devIndex];
       postImmWr->wr.rdma.remote_addr = remSizesRemoteAddr;
 
@@ -1061,18 +838,21 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
 
   struct ibv_send_wr* bad_wr = NULL;
   uint64_t spt0 = timer_get_cycles();
+  const bool singlePostKeepsImmInFirstWr = (nreqs == 1) && !needImmWr;
   for (int p = 0; p < postCount; p++) {
     ncclIbQp* qp = scratch->qpPerPost[p];
     int logicalQpIndex = scratch->qpIndexPerPost[p];
     int physicalQpIndex = physicalQpIndexByPost[p];
     struct ibv_send_wr* postWrs = ncclIbMultiSendScratchWrRow(scratch, p);
     struct ibv_send_wr* postImmWr = &postWrs[NCCL_NET_IB_MAX_RECVS];
-    struct ibv_send_wr* postHeadWr = (scratch->chainBytesPerPost[p] == 0) ? postImmWr : &postWrs[0];
+    struct ibv_send_wr* postHeadWr = singlePostKeepsImmInFirstWr ?
+        &postWrs[0] :
+        ((scratch->chainBytesPerPost[p] == 0) ? postImmWr : &postWrs[0]);
 
     ibQpSigPush(qp, reqs[0], spt0, scratch->chainBytesPerPost[p]);
     NCCLCHECK(wrap_ibv_post_send(qp->qp, postHeadWr, &bad_wr));
 
-    if (comm->base.resiliency) {
+    if (trackResiliency) {
       for (int r = 0; r < nreqs; r++) {
         reqs[r]->send.lastAttemptQpIndex[logicalQpIndex] = physicalQpIndex;
         reqs[r]->send.lastAttemptOrder[logicalQpIndex] = attemptOrder[physicalQpIndex];
@@ -1103,6 +883,19 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   }
 
   return ncclSuccess;
+}
+
+static ncclResult_t ibMultiSendFrmResiliency(struct ncclIbSendComm* comm, int slot) {
+  // Combined mode reuses the same send planner, but replay/failover ownership
+  // stays in the resiliency code and completion lookup stays on the baseline
+  // wr_id path.
+  return ibFrmMultiSendCore(comm, slot, true);
+}
+
+ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
+  if (!ibFrmEnabledForSend(comm)) return ibMultiSendBaseline(comm, slot);
+  if (comm->base.resiliency != NULL) return ibMultiSendFrmResiliency(comm, slot);
+  return ibFrmMultiSendCore(comm, slot, false);
 }
 
 ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void* mhandle, void* phandle, void** request) {
