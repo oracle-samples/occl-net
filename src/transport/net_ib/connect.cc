@@ -775,8 +775,8 @@ ib_connect:
         memset(comm->base.qps[q].sig_tsc, 0, sizeof(comm->base.qps[q].sig_tsc));
         memset(comm->base.qps[q].sig_bytes, 0, sizeof(comm->base.qps[q].sig_bytes));
         comm->base.frmFields.qp_lat[q] = 0;
-        comm->base.frmFields.qp_raw_lat[q] = 0;
-        comm->base.frmFields.qp_lat_bytes[q] = 0;
+        comm->base.frmCold.qp_raw_lat[q] = 0;
+        comm->base.frmCold.qp_lat_bytes[q] = 0;
         comm->base.frmFields.qp_zero_stamp_holdoff[q] = 0;
       }
 

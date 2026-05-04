@@ -38,6 +38,10 @@
 #define FRM_LAT_PRINT_MS 0
 #endif
 
+#ifndef FRM_DEBUG
+#define FRM_DEBUG 0
+#endif
+
 #define MAXSUFFIXSIZE 16
 #define MAXNAMESIZE (64 + MAXSUFFIXSIZE)
 extern char ncclIbIfName[MAX_IF_NAME_SIZE+1];
@@ -332,13 +336,20 @@ struct ncclIbResiliency;
 
 struct alignas(64) ncclIbNetCommFrmFields {
   uint64_t qp_lat[NCCL_IB_MAX_QPS];
-  uint64_t qp_raw_lat[NCCL_IB_MAX_QPS];
-  uint32_t qp_lat_bytes[NCCL_IB_MAX_QPS];
   ncclIbQpNumHash qpHash;
   uint8_t qp_zero_stamp_holdoff[NCCL_IB_MAX_QPS];
 };
 static_assert(alignof(struct ncclIbNetCommFrmFields) == 64, "ncclIbNetCommFrmFields must be 64-byte aligned");
 static_assert((sizeof(struct ncclIbNetCommFrmFields) % 64) == 0, "ncclIbNetCommFrmFields size must be 64-byte multiple");
+
+struct alignas(64) ibFrmColdFields {
+  // Raw latency and byte-count telemetry are updated on the completion/debug
+  // side and are not consulted when the send path computes FRM weights.
+  uint64_t qp_raw_lat[NCCL_IB_MAX_QPS];
+  uint32_t qp_lat_bytes[NCCL_IB_MAX_QPS];
+};
+static_assert(alignof(struct ibFrmColdFields) == 64, "ibFrmColdFields must be 64-byte aligned");
+static_assert((sizeof(struct ibFrmColdFields) % 64) == 0, "ibFrmColdFields size must be 64-byte multiple");
 
 struct alignas(128) ncclIbNetCommBase {
   ncclNetVDeviceProps_t vProps;
@@ -366,6 +377,7 @@ struct alignas(128) ncclIbNetCommBase {
   int connTc;
   int connSl;
   struct ncclIbResiliency* resiliency;
+  struct ibFrmColdFields frmCold;
 };
 static_assert(alignof(struct ncclIbNetCommBase) == 128, "ncclIbNetCommBase must be 128-byte aligned");
 static_assert(offsetof(struct ncclIbNetCommBase, reqs) < offsetof(struct ncclIbNetCommBase, frmFields), "reqs should stay ahead of frmFields");
@@ -373,6 +385,7 @@ static_assert(offsetof(struct ncclIbNetCommBase, qps) < offsetof(struct ncclIbNe
 static_assert(offsetof(struct ncclIbNetCommBase, remDevs) < offsetof(struct ncclIbNetCommBase, frmFields), "remDevs should stay ahead of frmFields");
 static_assert(offsetof(struct ncclIbNetCommBase, stats) < offsetof(struct ncclIbNetCommBase, frmFields), "stats should stay ahead of frmFields");
 static_assert(offsetof(struct ncclIbNetCommBase, activeQps) > offsetof(struct ncclIbNetCommBase, frmFields), "activeQps should stay behind frmFields");
+static_assert(offsetof(struct ncclIbNetCommBase, frmCold) > offsetof(struct ncclIbNetCommBase, activeQps), "frmCold should stay behind activeQps");
 
 struct ncclIbNetCommDevBase* ncclIbGetNetCommDevBase(ncclIbNetCommBase* base, int devIndex);
 
@@ -436,18 +449,28 @@ static inline ncclResult_t ncclIbPostRecvWorkRequest(struct ibv_qp* qp, struct i
 struct ncclIbMultiSendScratch {
   void* storage;
   int nqps;
+  // These row strides are padded to 128B so each row start stays aligned with
+  // the targeted cache sector boundary.
+  uint32_t chunkRowBytes;
+  uint32_t wrRowBytes;
+  uint32_t sgeRowBytes;
+#if FRM_DEBUG
+  uint32_t sendSzRowBytes;
+#endif
   float* lwPerQp;
   int* equalChunkSize;
   int* reqOffsetShadow;
   uintptr_t* sgeAddrShadow;
   uint64_t* remoteAddrShadow;
-  size_t* chunkSizePerReq;
+  uint32_t* chunkSizePerReq;
   ncclIbQp** qpPerPost;
   int* qpIndexPerPost;
   uint32_t* chainBytesPerPost;
   struct ibv_send_wr* wrsPerPost;
   struct ibv_sge* sgesPerPost;
-  size_t* sendSzPerPost;
+#if FRM_DEBUG
+  uint32_t* sendSzPerPost;
+#endif
 };
 
 struct ncclIbSendComm {
@@ -489,21 +512,23 @@ static_assert((sizeof(struct ncclIbSendFifo) % 32) == 0, "ncclIbSendFifo element
 static_assert((offsetof(struct ncclIbSendComm, sges) % 32) == 0, "sges must be 32-byte aligned");
 static_assert((offsetof(struct ncclIbSendComm, wrs) % 32) == 0, "wrs must be 32-byte aligned");
 
-static inline size_t* ncclIbMultiSendScratchChunkRow(struct ncclIbMultiSendScratch* scratch, int reqIndex) {
-  return scratch->chunkSizePerReq + (size_t)reqIndex * (size_t)scratch->nqps;
+static inline uint32_t* ncclIbMultiSendScratchChunkRow(struct ncclIbMultiSendScratch* scratch, int reqIndex) {
+  return (uint32_t*)((char*)scratch->chunkSizePerReq + (size_t)reqIndex * (size_t)scratch->chunkRowBytes);
 }
 
 static inline struct ibv_send_wr* ncclIbMultiSendScratchWrRow(struct ncclIbMultiSendScratch* scratch, int qpSlot) {
-  return scratch->wrsPerPost + (size_t)qpSlot * (NCCL_NET_IB_MAX_RECVS + 1);
+  return (struct ibv_send_wr*)((char*)scratch->wrsPerPost + (size_t)qpSlot * (size_t)scratch->wrRowBytes);
 }
 
 static inline struct ibv_sge* ncclIbMultiSendScratchSgeRow(struct ncclIbMultiSendScratch* scratch, int qpSlot) {
-  return scratch->sgesPerPost + (size_t)qpSlot * NCCL_NET_IB_MAX_RECVS;
+  return (struct ibv_sge*)((char*)scratch->sgesPerPost + (size_t)qpSlot * (size_t)scratch->sgeRowBytes);
 }
 
-static inline size_t* ncclIbMultiSendScratchSendSizeRow(struct ncclIbMultiSendScratch* scratch, int qpSlot) {
-  return scratch->sendSzPerPost + (size_t)qpSlot * NCCL_NET_IB_MAX_RECVS;
+#if FRM_DEBUG
+static inline uint32_t* ncclIbMultiSendScratchSendSizeRow(struct ncclIbMultiSendScratch* scratch, int qpSlot) {
+  return (uint32_t*)((char*)scratch->sendSzPerPost + (size_t)qpSlot * (size_t)scratch->sendSzRowBytes);
 }
+#endif
 
 struct ncclIbGpuFlush {
   struct ibv_mr* hostMr;

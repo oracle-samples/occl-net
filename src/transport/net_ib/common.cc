@@ -41,9 +41,8 @@ struct ncclIbNetCommDevBase* ncclIbGetNetCommDevBase(ncclIbNetCommBase* base, in
   }
 }
 
-static size_t ncclIbFrmRoundUpCacheline(size_t bytes) {
-  const size_t cacheline = 64;
-  return ((bytes + cacheline - 1) / cacheline) * cacheline;
+static size_t ibFrmRoundUp(size_t bytes, size_t alignment) {
+  return ((bytes + alignment - 1) / alignment) * alignment;
 }
 
 void ncclIbSendCommFreeMultiSendScratch(struct ncclIbSendComm* comm) {
@@ -53,6 +52,12 @@ void ncclIbSendCommFreeMultiSendScratch(struct ncclIbSendComm* comm) {
   free(scratch->storage);
   scratch->storage = NULL;
   scratch->nqps = 0;
+  scratch->chunkRowBytes = 0;
+  scratch->wrRowBytes = 0;
+  scratch->sgeRowBytes = 0;
+#if FRM_DEBUG
+  scratch->sendSzRowBytes = 0;
+#endif
   scratch->lwPerQp = NULL;
   scratch->equalChunkSize = NULL;
   scratch->reqOffsetShadow = NULL;
@@ -64,7 +69,9 @@ void ncclIbSendCommFreeMultiSendScratch(struct ncclIbSendComm* comm) {
   scratch->chainBytesPerPost = NULL;
   scratch->wrsPerPost = NULL;
   scratch->sgesPerPost = NULL;
+#if FRM_DEBUG
   scratch->sendSzPerPost = NULL;
+#endif
 }
 
 ncclResult_t ncclIbSendCommInitMultiSendScratch(struct ncclIbSendComm* comm) {
@@ -73,55 +80,94 @@ ncclResult_t ncclIbSendCommInitMultiSendScratch(struct ncclIbSendComm* comm) {
 
   struct ncclIbMultiSendScratch* scratch = &comm->multiSendScratch;
   const size_t nqps = (size_t)(comm->base.nqps > 0 ? comm->base.nqps : 0);
+  const size_t cachelineBytes = 64;
+  const size_t sectorBytes = 128;
   ncclIbSendCommFreeMultiSendScratch(comm);
   scratch->nqps = (int)nqps;
   if (nqps == 0) return ncclSuccess;
 
-  const size_t qpReqCount = nqps * NCCL_NET_IB_MAX_RECVS;
-  const size_t wrCount = nqps * (NCCL_NET_IB_MAX_RECVS + 1);
+  const size_t lwBytes = ibFrmRoundUp(nqps * sizeof(float), cachelineBytes);
+  const size_t equalChunkBytes = ibFrmRoundUp(NCCL_NET_IB_MAX_RECVS * sizeof(int), cachelineBytes);
+  const size_t reqOffsetBytes = ibFrmRoundUp(NCCL_NET_IB_MAX_RECVS * sizeof(int), cachelineBytes);
+  const size_t sgeAddrBytes = ibFrmRoundUp(NCCL_NET_IB_MAX_RECVS * sizeof(uintptr_t), cachelineBytes);
+  const size_t remoteAddrBytes = ibFrmRoundUp(NCCL_NET_IB_MAX_RECVS * sizeof(uint64_t), cachelineBytes);
+  const size_t chunkRowBytes = ibFrmRoundUp(nqps * sizeof(uint32_t), sectorBytes);
+  const size_t chunkBytes = NCCL_NET_IB_MAX_RECVS * chunkRowBytes;
+  const size_t qpPtrBytes = ibFrmRoundUp(nqps * sizeof(ncclIbQp*), cachelineBytes);
+  const size_t qpIndexBytes = ibFrmRoundUp(nqps * sizeof(int), cachelineBytes);
+  const size_t chainBytesBytes = ibFrmRoundUp(nqps * sizeof(uint32_t), cachelineBytes);
+  const size_t wrRowBytes = ibFrmRoundUp((NCCL_NET_IB_MAX_RECVS + 1) * sizeof(struct ibv_send_wr), sectorBytes);
+  const size_t wrBytes = nqps * wrRowBytes;
+  const size_t sgeRowBytes = ibFrmRoundUp(NCCL_NET_IB_MAX_RECVS * sizeof(struct ibv_sge), sectorBytes);
+  const size_t sgeBytes = nqps * sgeRowBytes;
+#if FRM_DEBUG
+  const size_t sendSzRowBytes = ibFrmRoundUp(NCCL_NET_IB_MAX_RECVS * sizeof(uint32_t), sectorBytes);
+  const size_t sendSzBytes = nqps * sendSzRowBytes;
+#endif
 
-  const size_t lwBytes = ncclIbFrmRoundUpCacheline(nqps * sizeof(float));
-  const size_t equalChunkBytes = ncclIbFrmRoundUpCacheline(NCCL_NET_IB_MAX_RECVS * sizeof(int));
-  const size_t reqOffsetBytes = ncclIbFrmRoundUpCacheline(NCCL_NET_IB_MAX_RECVS * sizeof(int));
-  const size_t sgeAddrBytes = ncclIbFrmRoundUpCacheline(NCCL_NET_IB_MAX_RECVS * sizeof(uintptr_t));
-  const size_t remoteAddrBytes = ncclIbFrmRoundUpCacheline(NCCL_NET_IB_MAX_RECVS * sizeof(uint64_t));
-  const size_t chunkBytes = ncclIbFrmRoundUpCacheline(qpReqCount * sizeof(size_t));
-  const size_t qpPtrBytes = ncclIbFrmRoundUpCacheline(nqps * sizeof(ncclIbQp*));
-  const size_t qpIndexBytes = ncclIbFrmRoundUpCacheline(nqps * sizeof(int));
-  const size_t chainBytesBytes = ncclIbFrmRoundUpCacheline(nqps * sizeof(uint32_t));
-  const size_t wrBytes = ncclIbFrmRoundUpCacheline(wrCount * sizeof(struct ibv_send_wr));
-  const size_t sgeBytes = ncclIbFrmRoundUpCacheline(qpReqCount * sizeof(struct ibv_sge));
-  const size_t sendSzBytes = ncclIbFrmRoundUpCacheline(qpReqCount * sizeof(size_t));
-  const size_t totalBytes = lwBytes + equalChunkBytes + reqOffsetBytes + sgeAddrBytes + remoteAddrBytes +
-      chunkBytes + qpPtrBytes + qpIndexBytes + chainBytesBytes + wrBytes + sgeBytes + sendSzBytes;
+  assert(chunkRowBytes <= UINT32_MAX);
+  assert(wrRowBytes <= UINT32_MAX);
+  assert(sgeRowBytes <= UINT32_MAX);
+#if FRM_DEBUG
+  assert(sendSzRowBytes <= UINT32_MAX);
+#endif
+  scratch->chunkRowBytes = (uint32_t)chunkRowBytes;
+  scratch->wrRowBytes = (uint32_t)wrRowBytes;
+  scratch->sgeRowBytes = (uint32_t)sgeRowBytes;
+#if FRM_DEBUG
+  scratch->sendSzRowBytes = (uint32_t)sendSzRowBytes;
+#endif
+
+  size_t totalBytes = 0;
+  const size_t lwOffset = totalBytes;
+  totalBytes += lwBytes;
+  const size_t equalChunkOffset = totalBytes;
+  totalBytes += equalChunkBytes;
+  const size_t reqOffsetOffset = totalBytes;
+  totalBytes += reqOffsetBytes;
+  const size_t sgeAddrOffset = totalBytes;
+  totalBytes += sgeAddrBytes;
+  const size_t remoteAddrOffset = totalBytes;
+  totalBytes += remoteAddrBytes;
+  totalBytes = ibFrmRoundUp(totalBytes, sectorBytes);
+  const size_t chunkOffset = totalBytes;
+  totalBytes += chunkBytes;
+  const size_t qpPtrOffset = totalBytes;
+  totalBytes += qpPtrBytes;
+  const size_t qpIndexOffset = totalBytes;
+  totalBytes += qpIndexBytes;
+  const size_t chainOffset = totalBytes;
+  totalBytes += chainBytesBytes;
+  totalBytes = ibFrmRoundUp(totalBytes, sectorBytes);
+  const size_t wrOffset = totalBytes;
+  totalBytes += wrBytes;
+  totalBytes = ibFrmRoundUp(totalBytes, sectorBytes);
+  const size_t sgeOffset = totalBytes;
+  totalBytes += sgeBytes;
+#if FRM_DEBUG
+  totalBytes = ibFrmRoundUp(totalBytes, sectorBytes);
+  const size_t sendSzOffset = totalBytes;
+  totalBytes += sendSzBytes;
+#endif
 
   NCCLCHECKGOTO(ncclIbMalloc((void**)&scratch->storage, totalBytes), ret, fail);
   memset(scratch->storage, 0, totalBytes);
   {
-    char* ptr = (char*)scratch->storage;
-    scratch->lwPerQp = (float*)ptr;
-    ptr += lwBytes;
-    scratch->equalChunkSize = (int*)ptr;
-    ptr += equalChunkBytes;
-    scratch->reqOffsetShadow = (int*)ptr;
-    ptr += reqOffsetBytes;
-    scratch->sgeAddrShadow = (uintptr_t*)ptr;
-    ptr += sgeAddrBytes;
-    scratch->remoteAddrShadow = (uint64_t*)ptr;
-    ptr += remoteAddrBytes;
-    scratch->chunkSizePerReq = (size_t*)ptr;
-    ptr += chunkBytes;
-    scratch->qpPerPost = (ncclIbQp**)ptr;
-    ptr += qpPtrBytes;
-    scratch->qpIndexPerPost = (int*)ptr;
-    ptr += qpIndexBytes;
-    scratch->chainBytesPerPost = (uint32_t*)ptr;
-    ptr += chainBytesBytes;
-    scratch->wrsPerPost = (struct ibv_send_wr*)ptr;
-    ptr += wrBytes;
-    scratch->sgesPerPost = (struct ibv_sge*)ptr;
-    ptr += sgeBytes;
-    scratch->sendSzPerPost = (size_t*)ptr;
+    char* base = (char*)scratch->storage;
+    scratch->lwPerQp = (float*)(base + lwOffset);
+    scratch->equalChunkSize = (int*)(base + equalChunkOffset);
+    scratch->reqOffsetShadow = (int*)(base + reqOffsetOffset);
+    scratch->sgeAddrShadow = (uintptr_t*)(base + sgeAddrOffset);
+    scratch->remoteAddrShadow = (uint64_t*)(base + remoteAddrOffset);
+    scratch->chunkSizePerReq = (uint32_t*)(base + chunkOffset);
+    scratch->qpPerPost = (ncclIbQp**)(base + qpPtrOffset);
+    scratch->qpIndexPerPost = (int*)(base + qpIndexOffset);
+    scratch->chainBytesPerPost = (uint32_t*)(base + chainOffset);
+    scratch->wrsPerPost = (struct ibv_send_wr*)(base + wrOffset);
+    scratch->sgesPerPost = (struct ibv_sge*)(base + sgeOffset);
+#if FRM_DEBUG
+    scratch->sendSzPerPost = (uint32_t*)(base + sendSzOffset);
+#endif
   }
 
   for (size_t i = 0; i < nqps; i++) {
@@ -149,6 +195,7 @@ fail:
 
 ncclResult_t ncclIbBaseCommInit(struct ncclIbNetCommBase* baseComm, bool isSend) {
   memset(&baseComm->frmFields, 0, sizeof(baseComm->frmFields));
+  memset(&baseComm->frmCold, 0, sizeof(baseComm->frmCold));
   for (int i = 0; i < NCCL_IB_MAX_QPS; i++) {
     baseComm->qps[i].ibPort = 0;
     baseComm->qps[i].accessFlags = 0;

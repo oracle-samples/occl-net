@@ -22,7 +22,6 @@ NCCL_PARAM(IbReceiverSideMatchingScheme, "IB_RECEIVER_SIDE_MATCHING_SCHEME", 0);
 NCCL_PARAM(FrmSpreadEpsUs, "FRM_SPREAD_EPS_US", 2);
 NCCL_PARAM(FrmZeroStampHoldoff, "FRM_ZERO_STAMP_HOLDOFF", 3);
 
-#define FRM_DEBUG 0
 #define FRM_LAT_NORM_MTU_BYTES 4096u
 #define FRM_LAT_NORM_HALF_MTU_BYTES 2048u
 
@@ -67,8 +66,8 @@ static inline void ibFrmFlushTelemetry(struct ncclIbSendComm* comm) {
   }
 
   memset(comm->base.frmFields.qp_lat, 0, sizeof(comm->base.frmFields.qp_lat));
-  memset(comm->base.frmFields.qp_raw_lat, 0, sizeof(comm->base.frmFields.qp_raw_lat));
-  memset(comm->base.frmFields.qp_lat_bytes, 0, sizeof(comm->base.frmFields.qp_lat_bytes));
+  memset(comm->base.frmCold.qp_raw_lat, 0, sizeof(comm->base.frmCold.qp_raw_lat));
+  memset(comm->base.frmCold.qp_lat_bytes, 0, sizeof(comm->base.frmCold.qp_lat_bytes));
   memset(comm->base.frmFields.qp_zero_stamp_holdoff, 0, sizeof(comm->base.frmFields.qp_zero_stamp_holdoff));
   for (int qpIndex = 0; qpIndex < comm->base.nqps; qpIndex++) {
     ncclIbQp* qp = &comm->base.qps[qpIndex];
@@ -192,8 +191,9 @@ static inline int ibQpSigPopReq(ncclIbQp* qp, struct ncclIbRequest** out_req) {
   return 1;
 }
 
-static inline void ibFrmComputeChunksAll(const float* lwArr, int nqps, size_t totalSize, int align, size_t* chunkSize) {
+static inline void ibFrmComputeChunksAll(const float* lwArr, int nqps, size_t totalSize, int align, uint32_t* chunkSize) {
   if (chunkSize == NULL || nqps <= 0) return;
+  assert(totalSize <= UINT32_MAX);
 
   size_t sum = 0;
   const size_t a = (size_t)align;
@@ -209,19 +209,21 @@ static inline void ibFrmComputeChunksAll(const float* lwArr, int nqps, size_t to
       if (cs > totalSize) cs = totalSize;
     }
 
-    chunkSize[q] = cs;
+    chunkSize[q] = (uint32_t)cs;
     sum += cs;
   }
 
   if (sum > totalSize) {
     size_t extra = sum - totalSize;
     for (int q = nqps - 1; q >= 0 && extra > 0; q--) {
-      size_t take = (chunkSize[q] > extra) ? extra : chunkSize[q];
-      chunkSize[q] -= take;
+      size_t cur = (size_t)chunkSize[q];
+      size_t take = (cur > extra) ? extra : cur;
+      cur -= take;
+      chunkSize[q] = (uint32_t)cur;
       extra -= take;
     }
   } else if (sum < totalSize) {
-    chunkSize[nqps - 1] += (totalSize - sum);
+    chunkSize[nqps - 1] += (uint32_t)(totalSize - sum);
   }
 }
 
@@ -597,7 +599,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
 
   if (nreqs == 1) {
     struct ncclIbRequest* const req = reqs[0];
-    size_t* const chunkRow = useFrmNow ? ncclIbMultiSendScratchChunkRow(scratch, 0) : NULL;
+    uint32_t* const chunkRow = useFrmNow ? ncclIbMultiSendScratchChunkRow(scratch, 0) : NULL;
     int reqOffset = scratch->reqOffsetShadow[0];
     uintptr_t sgeAddr = scratch->sgeAddrShadow[0];
     uint64_t remoteAddr = scratch->remoteAddrShadow[0];
@@ -630,19 +632,22 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       struct ibv_send_wr* postWrs = ncclIbMultiSendScratchWrRow(scratch, postCount);
       struct ibv_sge* postSges = ncclIbMultiSendScratchSgeRow(scratch, postCount);
       struct ibv_send_wr* postImmWr = &postWrs[NCCL_NET_IB_MAX_RECVS];
-      size_t* sendSzRow = ncclIbMultiSendScratchSendSizeRow(scratch, postCount);
       struct ibv_send_wr* signaledWr = &postWrs[0];
       const uint64_t wridForPost = wrid_pack_with_qp(wr_id, (uint32_t)logicalQpIndex);
       const int devIndex = qp->devIndex;
+      const uint32_t sendBytes32 = (sendSz > (size_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)sendSz;
+#if FRM_DEBUG
+      uint32_t* sendSzRow = ncclIbMultiSendScratchSendSizeRow(scratch, postCount);
+#endif
 
       scratch->qpPerPost[postCount] = qp;
       scratch->qpIndexPerPost[postCount] = logicalQpIndex;
       physicalQpIndexByPost[postCount] = physicalQpIndex;
 #if FRM_DEBUG
       requestOrderByPost[postCount] = i;
+      sendSzRow[0] = sendBytes32;
 #endif
-      scratch->chainBytesPerPost[postCount] = (sendSz > (size_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)sendSz;
-      sendSzRow[0] = sendSz;
+      scratch->chainBytesPerPost[postCount] = sendBytes32;
 
       signaledWr->wr.rdma.rkey = slots[0].rkeys[qp->remDevIdx];
       signaledWr->wr.rdma.remote_addr = curRemoteAddr;
@@ -691,7 +696,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       req->pInfo[0].data.qp.wr_id = signaledWr->wr_id;
       req->pInfo[0].data.qp.opcode = signaledWr->opcode;
       req->pInfo[0].data.qp.qpNum = qp->qp->qp_num;
-      req->pInfo[0].data.qp.length = (uint32_t)sendSzRow[0];
+      req->pInfo[0].data.qp.length = sendBytes32;
       void* pHandle = req->pInfo[0].pHandle;
       NCCLCHECK(ncclProfilerFunction(&req->pInfo[0].qpEventHandles[nEventHandles], ncclProfilerNetEventStart,
                                      pHandle, pluginId, &req->pInfo[0].data));
@@ -702,8 +707,8 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
         const float postLw = split ? lwArr[logicalQpIndex] : lwArr[i];
         comm->cim->lw[logicalQpIndex] = postLw;
         comm->cim->latency[logicalQpIndex] = comm->base.frmFields.qp_lat[logicalQpIndex];
-        comm->cim->raw_latency[logicalQpIndex] = comm->base.frmFields.qp_raw_lat[logicalQpIndex];
-        comm->cim->lat_bytes[logicalQpIndex] = comm->base.frmFields.qp_lat_bytes[logicalQpIndex];
+        comm->cim->raw_latency[logicalQpIndex] = comm->base.frmCold.qp_raw_lat[logicalQpIndex];
+        comm->cim->lat_bytes[logicalQpIndex] = comm->base.frmCold.qp_lat_bytes[logicalQpIndex];
       }
 
       postCount++;
@@ -720,12 +725,15 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       struct ibv_send_wr* postWrs = ncclIbMultiSendScratchWrRow(scratch, postCount);
       struct ibv_sge* postSges = ncclIbMultiSendScratchSgeRow(scratch, postCount);
       struct ibv_send_wr* postImmWr = &postWrs[NCCL_NET_IB_MAX_RECVS];
-      size_t* sendSzRow = ncclIbMultiSendScratchSendSizeRow(scratch, postCount);
       size_t chainBytes = 0;
       struct ibv_send_wr* lastDataWr = NULL;
       int liveDataWrCount = 0;
+#if FRM_DEBUG
+      uint32_t* sendSzRow = ncclIbMultiSendScratchSendSizeRow(scratch, postCount);
+#endif
 #ifdef NCCL_ENABLE_NET_PROFILING
       int dataWrSlotByReq[NCCL_NET_IB_MAX_RECVS];
+      uint32_t profileBytesByReq[NCCL_NET_IB_MAX_RECVS] = {0};
       for (int r = 0; r < nreqs; r++) dataWrSlotByReq[r] = -1;
 #endif
 
@@ -746,8 +754,13 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
 
         if (skipDelivered) continue;
 
-        sendSzRow[r] = sendSz;
         chainBytes += sendSz;
+#if FRM_DEBUG
+        sendSzRow[r] = (sendSz > (size_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)sendSz;
+#endif
+#ifdef NCCL_ENABLE_NET_PROFILING
+        profileBytesByReq[r] = (sendSz > (size_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)sendSz;
+#endif
         if (length <= 0) continue;
 
         const int wrSlot = liveDataWrCount++;
@@ -812,7 +825,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
         reqs[r]->pInfo[0].data.qp.wr_id = (wrSlot >= 0) ? postWrs[wrSlot].wr_id : 0ULL;
         reqs[r]->pInfo[0].data.qp.opcode = (wrSlot >= 0) ? postWrs[wrSlot].opcode : IBV_WR_RDMA_WRITE;
         reqs[r]->pInfo[0].data.qp.qpNum = qp->qp->qp_num;
-        reqs[r]->pInfo[0].data.qp.length = (uint32_t)sendSzRow[r];
+        reqs[r]->pInfo[0].data.qp.length = profileBytesByReq[r];
         void* pHandle = reqs[r]->pInfo[0].pHandle;
         NCCLCHECK(ncclProfilerFunction(&reqs[r]->pInfo[0].qpEventHandles[nEventHandles], ncclProfilerNetEventStart,
                                        pHandle, pluginId, &reqs[r]->pInfo[0].data));
@@ -824,8 +837,8 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
         const float postLw = split ? lwArr[logicalQpIndex] : lwArr[i];
         comm->cim->lw[logicalQpIndex] = postLw;
         comm->cim->latency[logicalQpIndex] = comm->base.frmFields.qp_lat[logicalQpIndex];
-        comm->cim->raw_latency[logicalQpIndex] = comm->base.frmFields.qp_raw_lat[logicalQpIndex];
-        comm->cim->lat_bytes[logicalQpIndex] = comm->base.frmFields.qp_lat_bytes[logicalQpIndex];
+        comm->cim->raw_latency[logicalQpIndex] = comm->base.frmCold.qp_raw_lat[logicalQpIndex];
+        comm->cim->lat_bytes[logicalQpIndex] = comm->base.frmCold.qp_lat_bytes[logicalQpIndex];
       }
 
       postCount++;
@@ -862,12 +875,12 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
     }
 
 #if FRM_DEBUG
-    size_t* sendSzRow = ncclIbMultiSendScratchSendSizeRow(scratch, p);
+    uint32_t* sendSzRow = ncclIbMultiSendScratchSendSizeRow(scratch, p);
     for (int r = 0; r < nreqs; r++) {
       const float postLw = split ? lwArr[logicalQpIndex] : lwArr[requestOrderByPost[p]];
       printf("FRM post: qp=%d phys=%d request=%d send=%zu lw=%.6f lat=%lu raw_lat=%lu\n",
-             logicalQpIndex, physicalQpIndex, r, sendSzRow[r], postLw,
-             comm->base.frmFields.qp_lat[logicalQpIndex], comm->base.frmFields.qp_raw_lat[logicalQpIndex]);
+             logicalQpIndex, physicalQpIndex, r, (size_t)sendSzRow[r], postLw,
+             comm->base.frmFields.qp_lat[logicalQpIndex], comm->base.frmCold.qp_raw_lat[logicalQpIndex]);
       fflush(stdout);
     }
 #endif
@@ -1477,10 +1490,10 @@ static inline void ibFrmUpdateLatencyStamp(struct ncclIbRequest* req, struct ibv
   const double inv = (g_inv_cyc_per_us > 0.0) ? g_inv_cyc_per_us : 0.0;
   uint64_t us = (inv > 0.0) ? (uint64_t)((double)(t1 - t0) * inv) : 0;
   if (captureRawLat) {
-    req->base->frmFields.qp_raw_lat[qpIndex] = us;
+    req->base->frmCold.qp_raw_lat[qpIndex] = us;
   }
   req->base->frmFields.qp_lat[qpIndex] = norm_lat_us_per_mtu(us, bytes);
-  req->base->frmFields.qp_lat_bytes[qpIndex] = bytes;
+  req->base->frmCold.qp_lat_bytes[qpIndex] = bytes;
 }
 
 static ncclResult_t ibTestBaseline(void* request, int* done, int* sizes) {
