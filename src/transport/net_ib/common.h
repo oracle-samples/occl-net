@@ -332,6 +332,8 @@ typedef struct {
   uint16_t vals[QP_MAP_SIZE];
 } ncclIbQpNumHash;
 
+static inline int qpMapFind(const ncclIbQpNumHash* m, uint32_t qp_num);
+
 // Forward declaration
 struct ncclIbResiliency;
 
@@ -418,6 +420,15 @@ static inline ncclResult_t ncclIbCommBaseGetQpForRequest(struct ncclIbNetCommBas
 static inline ncclResult_t ncclIbCommBaseGetQpByQpNum(struct ncclIbNetCommBase* commBase, int devIndex, uint32_t qpNum, ncclIbQp** qp, int* qpIndex) {
   assert(devIndex >= 0 && devIndex < commBase->vProps.ndevs);
   assert(qp != NULL);
+  int hashedQpIndex = qpMapFind(&commBase->frmFields.qpHash, qpNum);
+  if ((unsigned)hashedQpIndex < (unsigned)commBase->nqps) {
+    ncclIbQp* hashedQp = &commBase->qps[hashedQpIndex];
+    if (hashedQp->qp != NULL && hashedQp->devIndex == devIndex && hashedQp->qp->qp_num == qpNum) {
+      *qp = hashedQp;
+      if (qpIndex != NULL) *qpIndex = hashedQpIndex;
+      return ncclSuccess;
+    }
+  }
   TRACE(NCCL_NET, "NET/IB: %s: Looking for QP num %u on devIndex %d among %d QPs", __func__, qpNum, devIndex, commBase->nqps / commBase->vProps.ndevs);
   for (int qpIndexInDev = 0; qpIndexInDev < (commBase->nqps / commBase->vProps.ndevs); qpIndexInDev++) {
     *qp = &(commBase->qps[commBase->vProps.ndevs*qpIndexInDev + devIndex]);

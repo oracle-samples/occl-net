@@ -95,6 +95,10 @@ struct ncclIbResiliency {
   // module.
   int outstandingRequests;
 
+  // Cached summary for the FRM gate so the send completion path does not need
+  // to rescan every QP state on each successful CQE.
+  bool frmAllQpsHealthy;
+
   // Per-QP rejoin tracking. The implementation intentionally keeps the state
   // local to each communicator to avoid cross-comm coupling.
   struct ncclIbResiliencyQpInfo qpInfo[NCCL_IB_MAX_QPS];

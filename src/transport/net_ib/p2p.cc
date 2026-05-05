@@ -50,11 +50,7 @@ static inline uint64_t ibFrmSpreadEpsUs() {
 
 static inline bool ibFrmResiliencyHealthy(const struct ncclIbNetCommBase* base) {
   if (base == NULL || base->resiliency == NULL) return true;
-  if (base->resiliency->inProgress) return false;
-  for (int qpIndex = 0; qpIndex < base->nqps; qpIndex++) {
-    if (base->resiliency->qpInfo[qpIndex].state != ncclIbResiliencyQpStateOk) return false;
-  }
-  return true;
+  return !base->resiliency->inProgress && base->resiliency->frmAllQpsHealthy;
 }
 
 static inline void ibFrmFlushTelemetry(struct ncclIbSendComm* comm) {
@@ -1311,8 +1307,10 @@ static ncclResult_t ncclIbLogCompletionWithError(struct ncclIbNetCommBase* commB
 }
 
 static inline ncclResult_t ncclIbCompletionEventProcess(struct ncclIbNetCommBase* commBase, struct ibv_wc* wc, int devIndex) {
+#ifdef ENABLE_TRACE
   union ncclSocketAddress addr;
   ncclSocketGetAddr(&commBase->sock, &addr);
+#endif
 
   struct ncclIbRequest* req = NULL;
   NCCLCHECK(ncclIbRequestRetrieveFromCompletion(commBase, wc, devIndex, &req));
@@ -1337,6 +1335,23 @@ static inline ncclResult_t ncclIbCompletionEventProcess(struct ncclIbNetCommBase
       WARN("NET/IB: %s: Sender expected a 'send' request but got '%s' (req=%p, comm=%p, id=%ld, wc.wr_id=%ld, wc.opcode=%s(%d), wc.qp_num=%u)", __func__, ncclIbReqTypeStr[req->type], req, commBase, req->id, wc->wr_id, ibvWcOpcodeStr(wc->opcode), wc->opcode, wc->qp_num);
       return ncclInternalError;
     }
+
+    // The common all-reduce case completes a single live request. Avoid the
+    // slot-array walk used by multi-recv/send bookkeeping.
+    if (req->nreqs == 1) {
+      if (!commBase->resiliency && (req->events[devIndex] <= 0)) {
+        WARN("NET/IB: sendReq(%p)->events={%d,%d,%d,%d}, devIndex=%d, reqIdx=%d <= 0", req, req->events[0], req->events[1], req->events[2], req->events[3], devIndex, 0);
+        return ncclInternalError;
+      }
+      req->events[devIndex]--;
+      TRACE(NCCL_NET, "NET/IB: %s: Got completion for a send request (req=%p, comm=%p, id=%ld, devIndex=%d, qp_num=%u)", __func__, req, req->base, req->id, devIndex, wc->qp_num);
+#ifdef NCCL_ENABLE_NET_PROFILING
+      int qpIndex = getReqQpIndex(req, 0, wc->qp_num);
+      NCCLCHECK(ncclProfilerFunction(&req->pInfo[0].qpEventHandles[qpIndex], ncclProfilerNetEventStop, NULL, 0, NULL));
+#endif
+      return ncclSuccess;
+    }
+
     struct ncclIbSendComm* sendComm = (struct ncclIbSendComm*)commBase;
     struct ncclIbRequest* sendReq = NULL;
     int slot = req->id % NET_IB_MAX_REQUESTS;

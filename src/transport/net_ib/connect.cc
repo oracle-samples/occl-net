@@ -1165,6 +1165,9 @@ ib_recv:
                             && (ncclParamIbGdrFlushDisable() == 0)) ? 1 : 0;
 
   NCCLCHECKGOTO(ncclIbReceiverQpsCreateToRts(rComm, &remMeta, &meta), ret, fail);
+  // Receiver completions also need fast qp_num -> qpIndex lookup when
+  // pre-posted receives are enabled, so build the map once after QPs reach RTS.
+  qpMapBuild(&rComm->base);
   if (rComm->prepostReceiveWorkRequests) {
     NCCLCHECKGOTO(ncclIbReceiverPrePostReceiveWorkRequests(rComm), ret, fail);
   }

@@ -39,6 +39,19 @@ static inline void ncclIbResiliencyResetPeerReadyReadState(struct ncclIbResilien
   resCtx->peerReadyReadDevIndex = -1;
 }
 
+static inline void ibResiliencyRefreshFrmQpHealth(struct ncclIbResiliency* resCtx) {
+  assert(resCtx != NULL);
+  int nqps = (resCtx->baseComm != NULL && resCtx->baseComm->nqps > 0) ? resCtx->baseComm->nqps : 0;
+  bool allOk = true;
+  for (int qpIndex = 0; qpIndex < nqps; qpIndex++) {
+    if (resCtx->qpInfo[qpIndex].state != ncclIbResiliencyQpStateOk) {
+      allOk = false;
+      break;
+    }
+  }
+  resCtx->frmAllQpsHealthy = allOk;
+}
+
 // Checks if the error indicated in the given work completion is fatal or not.
 static ncclResult_t ncclIbResiliencyCheckErrorNotFatal(struct ncclIbResiliency* resCtx, struct ibv_wc *wc, int devIndex) {
   int nFailedDevices = 0;
@@ -220,11 +233,13 @@ static ncclResult_t ncclIbResiliencyMarkQpRejoinFailure(struct ncclIbResiliency*
 
   if (qpInfo->failCount >= IB_RESILIENCY_QP_REJOIN_MAX_FAILURES) {
     qpInfo->state = ncclIbResiliencyQpStateFailedPermanent;
+    ibResiliencyRefreshFrmQpHealth(resCtx);
     WARN("NET/IB: %s: Rejoin step %s exhausted retry budget for QP index %d (qp_num=%u, devIndex=%d, failCount=%d, comm=%p). Leaving the QP on failover permanently.",
          __func__, stage, qpIndex, qp->qp->qp_num, qp->devIndex, qpInfo->failCount, resCtx->baseComm);
     return ncclSuccess;
   }
 
+  ibResiliencyRefreshFrmQpHealth(resCtx);
   INFO(NCCL_NET, "NET/IB: %s: Rejoin step %s failed for QP index %d (qp_num=%u, devIndex=%d, failCount=%d/%d, comm=%p).",
        __func__, stage, qpIndex, qp->qp->qp_num, qp->devIndex, qpInfo->failCount, IB_RESILIENCY_QP_REJOIN_MAX_FAILURES, resCtx->baseComm);
   return ncclSuccess;
@@ -460,6 +475,7 @@ static ncclResult_t ncclIbResiliencyPeerReadyReadPost(struct ncclIbResiliency* r
 // peer-ready generation for the current recovery cycle.
 static ncclResult_t ncclIbResiliencyTryActivatePeerReadyQps(struct ncclIbResiliency* resCtx) {
   assert(resCtx != NULL);
+  bool refreshedAnyQp = false;
   for (int qpIndex = 0; qpIndex < resCtx->baseComm->nqps; qpIndex++) {
     struct ncclIbResiliencyQpInfo* qpInfo = &resCtx->qpInfo[qpIndex];
     if (qpInfo->state != ncclIbResiliencyQpStateLocalReady) continue;
@@ -474,9 +490,11 @@ static ncclResult_t ncclIbResiliencyTryActivatePeerReadyQps(struct ncclIbResilie
     qpInfo->lastAttemptNs = 0;
     qpInfo->localPortRetryLogged = false;
     resCtx->activatedRemoteReadyEpoch[qpIndex] = remoteEpoch;
+    refreshedAnyQp = true;
     INFO(NCCL_NET, "NET/IB: %s: Activated peer-ready QP index %d (qp_num=%u, devIndex=%d, remoteReadyEpoch=%u, comm=%p).",
          __func__, qpIndex, resCtx->baseComm->qps[qpIndex].qp->qp_num, resCtx->baseComm->qps[qpIndex].devIndex, remoteEpoch, resCtx->baseComm);
   }
+  if (refreshedAnyQp) ibResiliencyRefreshFrmQpHealth(resCtx);
   return ncclSuccess;
 }
 
@@ -566,6 +584,7 @@ static ncclResult_t ncclIbResiliencyTryRejoinSingleQp(struct ncclIbResiliency* r
   resCtx->localReady.epoch[qpIndex] = localEpoch;
   ncclIbResiliencyReadyQpSetBit(resCtx->localReady.mask, qpIndex, true);
   qpInfo->state = ncclIbResiliencyQpStateLocalReady;
+  ibResiliencyRefreshFrmQpHealth(resCtx);
   resCtx->peerReadyReadLogged = false;
   INFO(NCCL_NET, "NET/IB: %s: Locally rebuilt QP index %d (qp_num=%u, devIndex=%d, remQpn=%u, localReadyEpoch=%u, comm=%p). Waiting for peer-ready.",
        __func__, qpIndex, qp->qp->qp_num, qp->devIndex, qp->remQpn, localEpoch, resCtx->baseComm);
@@ -1182,6 +1201,7 @@ ncclResult_t ncclIbResiliencyInit(struct ncclIbNetCommBase* baseComm, struct ncc
     baseCtx->qpInfo[i].localPortRetryLogged = false;
     baseCtx->qpInfo[i].failCount = 0;
   }
+  ibResiliencyRefreshFrmQpHealth(baseCtx);
   baseCtx->peerReadyReadLogged = false;
   if (baseComm->isSend) {
     struct ncclIbResiliencySend* sendResCtx = (struct ncclIbResiliencySend*)baseCtx;
@@ -1232,6 +1252,7 @@ ncclResult_t ncclIbResiliencyMarkQpFailed(struct ncclIbResiliency* resCtx, int q
   qpInfo->failCount++;
   ncclIbResiliencyReadyQpSetBit(resCtx->localReady.mask, qpIndex, false);
   ncclIbResiliencyReadyQpSetBit(resCtx->remoteReady.mask, qpIndex, false);
+  ibResiliencyRefreshFrmQpHealth(resCtx);
   // Keep background progress active until QP rehabilitation converges.
   resCtx->inProgress = true;
   INFO(NCCL_NET, "NET/IB: %s: Marked QP index %d as failed (qp_num=%u, devIndex=%d, comm=%p).",
