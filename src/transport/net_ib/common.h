@@ -188,6 +188,40 @@ struct alignas(64) ncclIbRequestCompletionRecord {
 static_assert(alignof(struct ncclIbRequestCompletionRecord) == 64, "ncclIbRequestCompletionRecord must be 64-byte aligned");
 static_assert((sizeof(struct ncclIbRequestCompletionRecord) % 64) == 0, "ncclIbRequestCompletionRecord size must be a 64-byte multiple");
 
+struct ncclIbRequestSendState {
+  // Current send-attempt CQE token. Reposts refresh this so late CQEs from
+  // older attempts cannot masquerade as fresh failures on the same request.
+  uint64_t wrIdToken;
+  int size;
+  void* data;
+  uint32_t lkeys[NCCL_IB_MAX_DEVS_PER_NIC];
+  // Tracks logical request chunks that still need delivery.
+  bool pendingData[NCCL_IB_MAX_QPS];
+  // Physical QP index used for each logical chunk in the most recent send
+  // attempt. Entries remain -1 for logical chunks that were not attempted.
+  int lastAttemptQpIndex[NCCL_IB_MAX_QPS];
+  // In-order position of the logical chunk within the physical QP stream
+  // for the most recent send attempt.
+  uint8_t lastAttemptOrder[NCCL_IB_MAX_QPS];
+  // Number of receiver completions already credited per physical QP.
+  uint16_t ackedCompletions[NCCL_IB_MAX_QPS];
+};
+static_assert(offsetof(struct ncclIbRequestSendState, pendingData) == 40, "ncclIbRequestSendState::pendingData offset changed");
+static_assert(offsetof(struct ncclIbRequestSendState, lastAttemptQpIndex) == 168, "ncclIbRequestSendState::lastAttemptQpIndex offset changed");
+static_assert(offsetof(struct ncclIbRequestSendState, lastAttemptOrder) == 680, "ncclIbRequestSendState::lastAttemptOrder offset changed");
+static_assert(offsetof(struct ncclIbRequestSendState, ackedCompletions) == 808, "ncclIbRequestSendState::ackedCompletions offset changed");
+
+struct ncclIbRequestRecvState {
+  struct ncclIbRequestCompletionRecord* cmplsRecords;
+  // Aggregates the size of a send request when sender does not write to the
+  // completion records array.
+  int aggSize;
+};
+
+struct ncclIbRequestIputState {
+  int rank;
+};
+
 struct alignas(64) ncclIbRequest {
   struct ncclIbNetCommBase* base;
   int type;
@@ -207,41 +241,27 @@ struct alignas(64) ncclIbRequest {
 #ifdef NCCL_ENABLE_NET_PROFILING
   struct ncclProfilerInfo pInfo[NCCL_NET_IB_MAX_RECVS];
 #endif
+  // Keep the scalar request header compact. connectionId intentionally
+  // consumes the 4-byte hole after nreqs so the send/recv payload union keeps
+  // its current cache-line placement instead of growing the request slab.
   uint64_t id;
   int nreqs;
-  union {
-    struct {
-      // Current send-attempt CQE token. Reposts refresh this so late CQEs from
-      // older attempts cannot masquerade as fresh failures on the same request.
-      uint64_t wrIdToken;
-      int size;
-      void* data;
-      uint32_t lkeys[NCCL_IB_MAX_DEVS_PER_NIC];
-      // Tracks logical request chunks that still need delivery.
-      bool pendingData[NCCL_IB_MAX_QPS];
-      // Physical QP index used for each logical chunk in the most recent send
-      // attempt. Entries remain -1 for logical chunks that were not attempted.
-      int lastAttemptQpIndex[NCCL_IB_MAX_QPS];
-      // In-order position of the logical chunk within the physical QP stream
-      // for the most recent send attempt.
-      uint8_t lastAttemptOrder[NCCL_IB_MAX_QPS];
-      // Number of receiver completions already credited per physical QP.
-      uint16_t ackedCompletions[NCCL_IB_MAX_QPS];
-    } send;
-    struct {
-      struct ncclIbRequestCompletionRecord* cmplsRecords;
-      // Aggregates the size of a send request when sender does not write to the
-      // completion records array.
-      int aggSize;
-    } recv;
-    struct {
-      int rank;
-    } iput;
-  };
   int connectionId;
+  union {
+    struct ncclIbRequestSendState send;
+    struct ncclIbRequestRecvState recv;
+    struct ncclIbRequestIputState iput;
+  };
 };
 static_assert(alignof(struct ncclIbRequest) == 64, "ncclIbRequest must be 64-byte aligned");
 static_assert((sizeof(struct ncclIbRequest) % 64) == 0, "ncclIbRequest size must be a 64-byte multiple");
+#ifndef NCCL_ENABLE_NET_PROFILING
+static_assert(sizeof(struct ncclIbRequest) == 1152, "ncclIbRequest should stay trimmed to 1152B without profiling");
+static_assert(offsetof(struct ncclIbRequest, connectionId) == 84, "ncclIbRequest::connectionId should consume the header pad");
+static_assert(offsetof(struct ncclIbRequest, send) == 88, "ncclIbRequest::send offset changed");
+static_assert((offsetof(struct ncclIbRequest, send) + offsetof(struct ncclIbRequestSendState, pendingData)) == 128, "ncclIbRequest::send.pendingData should stay on the 128B boundary");
+static_assert((offsetof(struct ncclIbRequest, send) + offsetof(struct ncclIbRequestSendState, lastAttemptQpIndex)) == 256, "ncclIbRequest::send.lastAttemptQpIndex should stay 256B from the request base");
+#endif
 
 struct alignas(64) ncclIbNetCommDevBase {
   int ibDevN;
