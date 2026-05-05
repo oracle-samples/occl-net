@@ -20,7 +20,7 @@ NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 // By default, use ncclIbRequestMatchingScheme::BY_INDEX matching scheme.
 NCCL_PARAM(IbReceiverSideMatchingScheme, "IB_RECEIVER_SIDE_MATCHING_SCHEME", 0);
 NCCL_PARAM(FrmSpreadEpsUs, "FRM_SPREAD_EPS_US", 2);
-NCCL_PARAM(FrmZeroStampHoldoff, "FRM_ZERO_STAMP_HOLDOFF", 3);
+NCCL_PARAM(FrmZeroStampHoldoff, "FRM_ZERO_STAMP_HOLDOFF", 2);
 
 #define FRM_LAT_NORM_MTU_BYTES 4096u
 #define FRM_LAT_NORM_HALF_MTU_BYTES 2048u
@@ -1440,15 +1440,20 @@ static inline void ibFrmUpdateLatencyStamp(struct ncclIbRequest* req, struct ibv
   uint64_t t0 = 0;
   uint32_t bytes = 0;
   if (!ibQpSigPop(qp, &t0, &bytes)) return;
-  if (bytes == 0 && kZeroStampHoldoff != 0) {
-    uint8_t skip = req->base->frmFields.qp_zero_stamp_holdoff[qpIndex];
-    if (skip < kZeroStampHoldoff) {
-      req->base->frmFields.qp_zero_stamp_holdoff[qpIndex] = (uint8_t)(skip + 1);
-      return;
+  // Keep the single-request completion path responsive: the upstream FRM fast
+  // path stopped suppressing zero-byte stamps here so a QP can re-enter the
+  // congestion policy loop without waiting through an extra holdoff window.
+  if (req->nreqs != 1) {
+    if (bytes == 0 && kZeroStampHoldoff != 0) {
+      uint8_t skip = req->base->frmFields.qp_zero_stamp_holdoff[qpIndex];
+      if (skip < kZeroStampHoldoff) {
+        req->base->frmFields.qp_zero_stamp_holdoff[qpIndex] = (uint8_t)(skip + 1);
+        return;
+      }
+      req->base->frmFields.qp_zero_stamp_holdoff[qpIndex] = 0;
+    } else {
+      req->base->frmFields.qp_zero_stamp_holdoff[qpIndex] = 0;
     }
-    req->base->frmFields.qp_zero_stamp_holdoff[qpIndex] = 0;
-  } else {
-    req->base->frmFields.qp_zero_stamp_holdoff[qpIndex] = 0;
   }
 
   uint64_t t1 = timer_get_cycles();
