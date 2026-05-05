@@ -172,7 +172,7 @@ extern const char* ncclIbReqTypeStr[];
 
 // Tracks data transfers between sender and receiver. A multi-recv/send uses a
 // single record.
-struct ncclIbRequestCompletionRecord {
+struct alignas(64) ncclIbRequestCompletionRecord {
   // This array communicates data transfer sizes from the sender to the
   // receiver. The sender writes the size of each completed data transfer to
   // this array. The receiver reads these sizes before reporting completion of
@@ -185,8 +185,10 @@ struct ncclIbRequestCompletionRecord {
   // indices that produced the completions.
   uint16_t completions[NCCL_IB_MAX_QPS];
 };
+static_assert(alignof(struct ncclIbRequestCompletionRecord) == 64, "ncclIbRequestCompletionRecord must be 64-byte aligned");
+static_assert((sizeof(struct ncclIbRequestCompletionRecord) % 64) == 0, "ncclIbRequestCompletionRecord size must be a 64-byte multiple");
 
-struct ncclIbRequest {
+struct alignas(64) ncclIbRequest {
   struct ncclIbNetCommBase* base;
   int type;
   struct ncclSocket* sock;
@@ -238,14 +240,18 @@ struct ncclIbRequest {
   };
   int connectionId;
 };
+static_assert(alignof(struct ncclIbRequest) == 64, "ncclIbRequest must be 64-byte aligned");
+static_assert((sizeof(struct ncclIbRequest) % 64) == 0, "ncclIbRequest size must be a 64-byte multiple");
 
-struct ncclIbNetCommDevBase {
+struct alignas(64) ncclIbNetCommDevBase {
   int ibDevN;
   struct ibv_pd* pd;
   struct ibv_cq* cq;
   uint64_t pad[2];
   struct ncclIbGidInfo gidInfo;
 };
+static_assert(alignof(struct ncclIbNetCommDevBase) == 64, "ncclIbNetCommDevBase must be 64-byte aligned");
+static_assert((sizeof(struct ncclIbNetCommDevBase) % 64) == 0, "ncclIbNetCommDevBase size must be a 64-byte multiple");
 
 struct ncclIbSendFifo {
   uint64_t addr;
@@ -309,13 +315,15 @@ struct ncclIbRemCompletionsRecords {
 };
 
 // A per-dev struct for netIbSendComm
-struct alignas(8) ncclIbSendCommDev {
+struct alignas(64) ncclIbSendCommDev {
   struct ncclIbNetCommDevBase base;
   struct ibv_mr* ctsFifoMr;
   struct ibv_mr* putSignalScratchpadMr;
   struct ibv_mr* cmplsRecordsMr;
   struct ibv_sge sge;
 };
+static_assert(alignof(struct ncclIbSendCommDev) == 64, "ncclIbSendCommDev must be 64-byte aligned");
+static_assert((sizeof(struct ncclIbSendCommDev) % 64) == 0, "ncclIbSendCommDev size must be a 64-byte multiple");
 
 
 // Wrapper to track an MR per-device, if needed
@@ -458,7 +466,7 @@ static inline ncclResult_t ncclIbPostRecvWorkRequest(struct ibv_qp* qp, struct i
   return ncclSuccess;
 }
 
-struct ncclIbMultiSendScratch {
+struct alignas(64) ncclIbMultiSendScratch {
   void* storage;
   int nqps;
   // These row strides are padded to 128B so each row start stays aligned with
@@ -484,8 +492,10 @@ struct ncclIbMultiSendScratch {
   uint32_t* sendSzPerPost;
 #endif
 };
+static_assert(alignof(struct ncclIbMultiSendScratch) == 64, "ncclIbMultiSendScratch must be 64-byte aligned");
+static_assert((sizeof(struct ncclIbMultiSendScratch) % 64) == 0, "ncclIbMultiSendScratch size must be a 64-byte multiple");
 
-struct ncclIbSendComm {
+struct alignas(128) ncclIbSendComm {
   struct ncclIbNetCommBase base;
   // Start with CTS FIFO and ibv structs as they have alignment restrictions
 
@@ -515,6 +525,8 @@ struct ncclIbSendComm {
   struct ncclIbMultiSendScratch multiSendScratch;
   bool frmGateOpen;
 };
+static_assert(alignof(struct ncclIbSendComm) == 128, "ncclIbSendComm must be 128-byte aligned");
+static_assert((sizeof(struct ncclIbSendComm) % 128) == 0, "ncclIbSendComm size must be a 128-byte multiple");
 // The SendFifo needs to be 32-byte aligned and each element needs
 // to be a 32-byte multiple, so that an entry does not get split and
 // written out of order when IB Relaxed Ordering is enabled
@@ -564,7 +576,7 @@ struct ncclIbRemCtsFifo {
   uint32_t flags;
 };
 
-struct alignas(16) ncclIbRecvCommDev {
+struct alignas(128) ncclIbRecvCommDev {
   struct ncclIbNetCommDevBase base;
   struct ncclIbGpuFlush gpuFlush;
   // MR that is obtained after registering the "shadow" CTS FIFO on the
@@ -582,10 +594,12 @@ struct alignas(16) ncclIbRecvCommDev {
   // in which the CTS message formatted on the receiver is placed.
   struct ibv_sge sge;
 };
+static_assert(alignof(struct ncclIbRecvCommDev) == 128, "ncclIbRecvCommDev must be 128-byte aligned");
+static_assert((sizeof(struct ncclIbRecvCommDev) % 128) == 0, "ncclIbRecvCommDev size must be a 128-byte multiple");
 
 #define NCCL_IB_RECV_WR_ID_DUMMY UINT64_MAX
 
-struct ncclIbRecvComm {
+struct alignas(128) ncclIbRecvComm {
   struct ncclIbNetCommBase base;
   struct ncclIbRecvCommDev devs[NCCL_IB_MAX_DEVS_PER_NIC];
   // Array of pointers to store the recv requests to allow faster access. The
@@ -606,6 +620,8 @@ struct ncclIbRecvComm {
   // and only the wr_id is updated before posting a receive work request.
   struct ibv_recv_wr ibRecvWorkRequest;
 };
+static_assert(alignof(struct ncclIbRecvComm) == 128, "ncclIbRecvComm must be 128-byte aligned");
+static_assert((sizeof(struct ncclIbRecvComm) % 128) == 0, "ncclIbRecvComm size must be a 128-byte multiple");
 static_assert((offsetof(struct ncclIbRecvComm, remCtsFifo) % 32) == 0, "ncclIbRecvComm ctsFifo must be 32-byte aligned");
 
 ncclResult_t ncclIbBaseCommInit(struct ncclIbNetCommBase* baseComm, bool isSend);
