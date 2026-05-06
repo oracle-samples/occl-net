@@ -22,7 +22,7 @@ enum ncclIbResiliencyDevState {
   ncclIbResiliencyDevStateErrorPermanent
 };
 
-struct ncclIbResiliencyDev {
+struct alignas(64) ncclIbResiliencyDev {
   enum ncclIbResiliencyDevState state;
   // CQ to get CQEs on the sender side for probing operations.
   // Receiver side is not expected to get any CQEs on the this CQ but Verbs
@@ -42,6 +42,8 @@ struct ncclIbResiliencyDev {
   uint64_t peerReadyRetryAfterNs;
   int peerReadyFailureCount;
 };
+static_assert(alignof(struct ncclIbResiliencyDev) == 64, "ncclIbResiliencyDev must be 64-byte aligned");
+static_assert((sizeof(struct ncclIbResiliencyDev) % 64) == 0, "ncclIbResiliencyDev size must be a 64-byte multiple");
 
 enum ncclIbResiliencyQpState {
   // QP is healthy and can be selected for traffic.
@@ -63,12 +65,14 @@ struct ncclIbResiliencyQpInfo {
   int failCount;
 };
 
-struct ibReadyStateSnapshot {
+struct alignas(64) ibReadyStateSnapshot {
   uint64_t mask[(NCCL_IB_MAX_QPS + 63) / 64];
   uint32_t epoch[NCCL_IB_MAX_QPS];
 };
+static_assert(alignof(struct ibReadyStateSnapshot) == 64, "ibReadyStateSnapshot must be 64-byte aligned");
+static_assert((sizeof(struct ibReadyStateSnapshot) % 64) == 0, "ibReadyStateSnapshot size must be a 64-byte multiple");
 
-struct ncclIbResiliency {
+struct alignas(128) ncclIbResiliency {
   // Back pointer to the base communicator.
   struct ncclIbNetCommBase* baseComm;
 
@@ -99,8 +103,8 @@ struct ncclIbResiliency {
   // to rescan every QP state on each successful CQE.
   bool frmAllQpsHealthy;
 
-  // Per-QP rejoin tracking. The implementation intentionally keeps the state
-  // local to each communicator to avoid cross-comm coupling.
+  // Keep per-QP rejoin state dense: progress scans the whole array, so
+  // per-entry cache-line alignment would reduce useful residency.
   struct ncclIbResiliencyQpInfo qpInfo[NCCL_IB_MAX_QPS];
 
   // Local and remote ready-state snapshots used for peer-ready synchronization.
@@ -122,6 +126,12 @@ struct ncclIbResiliency {
   int nextPeerReadyQpIndex;
   uint64_t lastPeerReadyReadNs;
 };
+static_assert(alignof(struct ncclIbResiliency) == 128, "ncclIbResiliency must be 128-byte aligned");
+static_assert((sizeof(struct ncclIbResiliency) % 128) == 0, "ncclIbResiliency size must be a 128-byte multiple");
+static_assert((offsetof(struct ncclIbResiliency, devs) % 64) == 0, "ncclIbResiliency::devs must stay 64-byte aligned");
+static_assert((offsetof(struct ncclIbResiliency, probingQps) % 128) == 0, "ncclIbResiliency::probingQps must stay 128-byte aligned");
+static_assert((offsetof(struct ncclIbResiliency, localReady) % 64) == 0, "ncclIbResiliency::localReady must stay 64-byte aligned");
+static_assert((offsetof(struct ncclIbResiliency, remoteReady) % 64) == 0, "ncclIbResiliency::remoteReady must stay 64-byte aligned");
 
 enum ncclIbResiliencyRequestSendState {
   // The request just encountered an error and waiting for probing to be
@@ -169,8 +179,10 @@ struct ncclIbResiliencyRemoteCompletionRecordsInfo {
   uint32_t rkey;
 };
 
-  struct ncclIbResiliencySend {
+struct alignas(128) ncclIbResiliencySend {
   struct ncclIbResiliency base;
+  // Keep failed-request entries dense: the replay path scans the whole array,
+  // and one-cache-line-per-entry padding would inflate the steady-state slab.
   // Array of requests that encountered an error. Requests in this array can be
   // waiting for probing and then possibly replay. Any request that encounters
   // an error is added to this array. If a replay is posted, the entry stays
@@ -196,12 +208,17 @@ struct ncclIbResiliencyRemoteCompletionRecordsInfo {
   // *simply* under a single MR (per device).
   uint16_t probingResults[NET_IB_MAX_REQUESTS][NCCL_IB_MAX_QPS];
 
+  // Keep these tiny per-device remote handles packed; the whole array is read
+  // as one small bundle when choosing the probing access path.
   // Stores information, per-device, used to access the completion records
   // structure on the receiver side.
   struct ncclIbResiliencyRemoteCompletionRecordsInfo remCmplRecordsInfo[NCCL_IB_MAX_DEVS_PER_NIC];
   // Monotonic token source for uniquely identifying probe completions.
   uint64_t nextProbeWrId;
 };
+static_assert(alignof(struct ncclIbResiliencySend) == 128, "ncclIbResiliencySend must be 128-byte aligned");
+static_assert((sizeof(struct ncclIbResiliencySend) % 128) == 0, "ncclIbResiliencySend size must be a 128-byte multiple");
+static_assert((offsetof(struct ncclIbResiliencySend, failedRequests) % 128) == 0, "ncclIbResiliencySend::failedRequests must stay 128-byte aligned");
 
 // -----------------------------
 // Data path APIs
