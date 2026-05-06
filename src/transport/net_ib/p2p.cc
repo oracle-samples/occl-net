@@ -27,13 +27,6 @@ NCCL_PARAM(FrmZeroStampHoldoff, "FRM_ZERO_STAMP_HOLDOFF", 2);
 
 static constexpr int kIbMultiSendAlign = 128;
 
-static inline uint64_t wrid_pack_with_qp(uint64_t req_pack, uint32_t qpIndex) {
-  (void)qpIndex;
-  // OCCL resiliency already uses the high bits for epoch/slot tracking.
-  // Keep the token unchanged and rebuild FRM QP mapping from wc->qp_num.
-  return req_pack;
-}
-
 static inline uint64_t ibFrmSpreadEpsUs() {
   static const uint64_t eps = []() -> uint64_t {
     const int64_t value = ncclParamFrmSpreadEpsUs();
@@ -613,14 +606,13 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       struct ibv_send_wr* postImmWr = &postWrs[NCCL_NET_IB_MAX_RECVS];
       struct ibv_send_wr* signaledWr = &postWrs[0];
       struct ibv_send_wr* postHeadWr = NULL;
-      const uint64_t wridForPost = wrid_pack_with_qp(wr_id, (uint32_t)logicalQpIndex);
       const int devIndex = qp->devIndex;
 #if FRM_DEBUG
       uint32_t* sendSzRow = ncclIbMultiSendScratchSendSizeRow(scratch, i);
       sendSzRow[0] = sendBytes32;
 #endif
 
-      signaledWr->wr_id = wridForPost;
+      signaledWr->wr_id = wr_id;
       signaledWr->wr.rdma.rkey = slots[0].rkeys[qp->remDevIdx];
       signaledWr->wr.rdma.remote_addr = curRemoteAddr;
       signaledWr->imm_data = immDataBe;
@@ -629,7 +621,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
         signaledWr->send_flags = 0;
         signaledWr->next = postImmWr;
 
-        postImmWr->wr_id = wridForPost;
+        postImmWr->wr_id = wr_id;
         postImmWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
         postImmWr->imm_data = immDataBe;
         postImmWr->next = NULL;
@@ -739,7 +731,6 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       struct ibv_sge* postSges = ncclIbMultiSendScratchSgeRow(scratch, postCount);
       struct ibv_send_wr* postImmWr = &postWrs[NCCL_NET_IB_MAX_RECVS];
       struct ibv_send_wr* signaledWr = &postWrs[0];
-      const uint64_t wridForPost = wrid_pack_with_qp(wr_id, (uint32_t)logicalQpIndex);
       const int devIndex = qp->devIndex;
       const uint32_t sendBytes32 = (sendSz > (size_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)sendSz;
 #if FRM_DEBUG
@@ -761,12 +752,12 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       postSges[0].addr = curSgeAddr;
 
       if (needImmWr) {
-        signaledWr->wr_id = wridForPost;
+        signaledWr->wr_id = wr_id;
         signaledWr->opcode = IBV_WR_RDMA_WRITE;
         signaledWr->send_flags = 0;
         signaledWr->next = postImmWr;
 
-        postImmWr->wr_id = wridForPost;
+        postImmWr->wr_id = wr_id;
         postImmWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
         postImmWr->imm_data = immDataBe;
         postImmWr->next = NULL;
@@ -776,7 +767,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
         postImmWr->wr.rdma.rkey = 0;
         postImmWr->wr.rdma.remote_addr = 0;
       } else {
-        signaledWr->wr_id = wridForPost;
+        signaledWr->wr_id = wr_id;
         signaledWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
         signaledWr->next = NULL;
         signaledWr->send_flags = IBV_SEND_SIGNALED;
@@ -876,7 +867,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
         dataWrSlotByReq[r] = wrSlot;
 #endif
 
-        postWr->wr_id = wrid_pack_with_qp(wr_id, (uint32_t)logicalQpIndex);
+        postWr->wr_id = wr_id;
         postWr->opcode = IBV_WR_RDMA_WRITE;
         postWr->send_flags = 0;
         postWr->next = NULL;
@@ -907,7 +898,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       scratch->chainBytesPerPost[postCount] = (chainBytes > (size_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)chainBytes;
 
       if (lastDataWr != NULL) lastDataWr->next = postImmWr;
-      postImmWr->wr_id = wrid_pack_with_qp(wr_id, (uint32_t)logicalQpIndex);
+      postImmWr->wr_id = wr_id;
       postImmWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
       postImmWr->imm_data = immDataBe;
       postImmWr->next = NULL;
