@@ -164,6 +164,20 @@ static inline int ibQpSigPop(ncclIbQp* qp, uint64_t* out_t0, uint32_t* out_bytes
   return 1;
 }
 
+static inline void ibFrmFinalizeDebugPublishing(struct ncclIbSendComm* comm, bool dbgLatEnabled, int* g_lat_src_set) {
+  if (!dbgLatEnabled || comm == NULL || comm->cim == NULL) return;
+
+  (void)__atomic_add_fetch(&comm->cim->dbg_seq, 1u, __ATOMIC_RELEASE);
+  if (*g_lat_src_set) return;
+
+  *g_lat_src_set = 1;
+  CIM_DebugLatPrinterSetWeightSource("lw", (volatile float*)comm->cim->lw, comm->base.nqps);
+  CIM_DebugLatPrinterSetSource("qp_lat(us)", (volatile uint64_t*)comm->cim->latency,
+                               (volatile uint64_t*)comm->cim->raw_latency, comm->base.nqps);
+  CIM_DebugLatPrinterSetByteSource("bytes", (volatile uint32_t*)comm->cim->lat_bytes, comm->base.nqps);
+  CIM_DebugLatPrinterSetSyncSeq(&comm->cim->dbg_seq);
+}
+
 static inline void ibFrmComputeChunksAll(const float* lwArr, int nqps, size_t totalSize, int align, uint32_t* chunkSize) {
   if (chunkSize == NULL || nqps <= 0) return;
   assert(totalSize <= UINT32_MAX);
@@ -497,11 +511,6 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
   const bool split = comm->base.splitDataOnQps == 1;
   const int activeBaseIx = reqs[0]->id % comm->base.nqps;
   const bool dbgLatEnabled = (comm->cim != NULL) && (FRM_LAT_PRINT_MS > 0);
-  uint8_t attemptOrder[NCCL_IB_MAX_QPS] = {0};
-  int physicalQpIndexByPost[NCCL_IB_MAX_QPS] = {0};
-#if FRM_DEBUG
-  int requestOrderByPost[NCCL_IB_MAX_QPS] = {0};
-#endif
 
   if (trackResiliency) {
     for (int r = 0; r < nreqs; r++) {
@@ -565,11 +574,135 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
     for (int r = 0; r < nreqs; r++) sizes[r] = reqs[r]->send.size;
   }
 
-  int postCount = 0;
   if (dbgLatEnabled) {
     (void)__atomic_add_fetch(&comm->cim->dbg_seq, 1u, __ATOMIC_RELEASE);
   }
 
+  // FRM-only single-request sends dominate the hot path. Post them directly
+  // and avoid staging per-post planner metadata for the shared second loop.
+  if (nreqs == 1 && !trackResiliency) {
+    struct ncclIbRequest* const req = reqs[0];
+    uint32_t* const chunkRow = useFrmNow ? ncclIbMultiSendScratchChunkRow(scratch, 0) : NULL;
+    int reqOffset = scratch->reqOffsetShadow[0];
+    uintptr_t sgeAddr = scratch->sgeAddrShadow[0];
+    uint64_t remoteAddr = scratch->remoteAddrShadow[0];
+    struct ibv_send_wr* bad_wr = NULL;
+    const bool singlePostKeepsImmInFirstWr = !needImmWr;
+    uint64_t spt0 = timer_get_cycles();
+
+    for (int i = 0; i < nqps; i++) {
+      int logicalQpIndex = -1;
+      ncclIbQp* qp = NULL;
+      NCCLCHECK(ncclIbCommBaseGetQpForRequest(&comm->base, req->id, i, &qp, &logicalQpIndex));
+      const int physicalQpIndex = (int)(qp - comm->base.qps);
+
+      size_t remaining = (size_t)(req->send.size - reqOffset);
+      size_t cs = !useFrmNow ? (size_t)scratch->equalChunkSize[0] : (split ? chunkRow[logicalQpIndex] : chunkRow[i]);
+      if (cs > remaining) cs = remaining;
+      const int length = (int)cs;
+      const size_t sendSz = (size_t)(length > 0 ? length : 0);
+      const uintptr_t curSgeAddr = sgeAddr;
+      const uint64_t curRemoteAddr = remoteAddr;
+      const uint32_t sendBytes32 = (sendSz > (size_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)sendSz;
+      reqOffset += (int)sendSz;
+      sgeAddr += sendSz;
+      remoteAddr += sendSz;
+
+      struct ibv_send_wr* postWrs = ncclIbMultiSendScratchWrRow(scratch, i);
+      struct ibv_sge* postSges = ncclIbMultiSendScratchSgeRow(scratch, i);
+      struct ibv_send_wr* postImmWr = &postWrs[NCCL_NET_IB_MAX_RECVS];
+      struct ibv_send_wr* signaledWr = &postWrs[0];
+      struct ibv_send_wr* postHeadWr = NULL;
+      const uint64_t wridForPost = wrid_pack_with_qp(wr_id, (uint32_t)logicalQpIndex);
+      const int devIndex = qp->devIndex;
+#if FRM_DEBUG
+      uint32_t* sendSzRow = ncclIbMultiSendScratchSendSizeRow(scratch, i);
+      sendSzRow[0] = sendBytes32;
+#endif
+
+      signaledWr->wr_id = wridForPost;
+      signaledWr->wr.rdma.rkey = slots[0].rkeys[qp->remDevIdx];
+      signaledWr->wr.rdma.remote_addr = curRemoteAddr;
+      signaledWr->imm_data = immDataBe;
+      if (needImmWr) {
+        signaledWr->opcode = IBV_WR_RDMA_WRITE;
+        signaledWr->send_flags = 0;
+        signaledWr->next = postImmWr;
+
+        postImmWr->wr_id = wridForPost;
+        postImmWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+        postImmWr->imm_data = immDataBe;
+        postImmWr->next = NULL;
+        postImmWr->send_flags = IBV_SEND_SIGNALED;
+        postImmWr->sg_list = NULL;
+        postImmWr->num_sge = 0;
+        postImmWr->wr.rdma.rkey = 0;
+        postImmWr->wr.rdma.remote_addr = 0;
+      } else {
+        signaledWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+        signaledWr->next = NULL;
+        signaledWr->send_flags = IBV_SEND_SIGNALED;
+      }
+
+      if (length <= 0) {
+        signaledWr->sg_list = NULL;
+        signaledWr->num_sge = 0;
+      } else {
+        postSges[0].addr = curSgeAddr;
+        postSges[0].lkey = req->send.lkeys[devIndex];
+        postSges[0].length = length;
+        signaledWr->sg_list = postSges;
+        signaledWr->num_sge = 1;
+      }
+
+#ifdef NCCL_ENABLE_NET_PROFILING
+      int nEventHandles = req->pInfo[0].nEventHandles;
+      assert(nEventHandles < MAX_QPS_PER_REQ);
+      req->pInfo[0].qpIndex[nEventHandles] = logicalQpIndex;
+      int64_t pluginId = NCCL_PROFILER_NET_TYPE_IB | NCCL_PROFILER_NET_IB_VER;
+      req->pInfo[0].data.type = ncclProfileQp;
+      req->pInfo[0].data.qp.device = devIndex;
+      req->pInfo[0].data.qp.wr_id = signaledWr->wr_id;
+      req->pInfo[0].data.qp.opcode = signaledWr->opcode;
+      req->pInfo[0].data.qp.qpNum = qp->qp->qp_num;
+      req->pInfo[0].data.qp.length = sendBytes32;
+      void* pHandle = req->pInfo[0].pHandle;
+      NCCLCHECK(ncclProfilerFunction(&req->pInfo[0].qpEventHandles[nEventHandles], ncclProfilerNetEventStart,
+                                     pHandle, pluginId, &req->pInfo[0].data));
+      req->pInfo[0].nEventHandles++;
+#endif
+
+      if (dbgLatEnabled) {
+        const float postLw = split ? lwArr[logicalQpIndex] : lwArr[i];
+        comm->cim->lw[logicalQpIndex] = postLw;
+        comm->cim->latency[logicalQpIndex] = comm->base.frmFields.qp_lat[logicalQpIndex];
+        comm->cim->raw_latency[logicalQpIndex] = comm->base.frmCold.qp_raw_lat[logicalQpIndex];
+        comm->cim->lat_bytes[logicalQpIndex] = comm->base.frmCold.qp_lat_bytes[logicalQpIndex];
+      }
+
+      postHeadWr = singlePostKeepsImmInFirstWr ? signaledWr : ((sendBytes32 == 0) ? postImmWr : signaledWr);
+      ibQpSigPush(qp, spt0, sendBytes32);
+      NCCLCHECK(wrap_ibv_post_send(qp->qp, postHeadWr, &bad_wr));
+
+#if FRM_DEBUG
+      const float postLw = split ? lwArr[logicalQpIndex] : lwArr[i];
+      printf("FRM post: qp=%d phys=%d request=%d send=%zu lw=%.6f lat=%lu raw_lat=%lu\n",
+             logicalQpIndex, physicalQpIndex, 0, (size_t)sendSzRow[0], postLw,
+             comm->base.frmFields.qp_lat[logicalQpIndex], comm->base.frmCold.qp_raw_lat[logicalQpIndex]);
+      fflush(stdout);
+#endif
+    }
+
+    ibFrmFinalizeDebugPublishing(comm, dbgLatEnabled, &g_lat_src_set);
+    return ncclSuccess;
+  }
+
+  uint8_t attemptOrder[NCCL_IB_MAX_QPS] = {0};
+  int physicalQpIndexByPost[NCCL_IB_MAX_QPS];
+#if FRM_DEBUG
+  int requestOrderByPost[NCCL_IB_MAX_QPS];
+#endif
+  int postCount = 0;
   if (nreqs == 1) {
     struct ncclIbRequest* const req = reqs[0];
     uint32_t* const chunkRow = useFrmNow ? ncclIbMultiSendScratchChunkRow(scratch, 0) : NULL;
@@ -818,10 +951,6 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
     }
   }
 
-  if (dbgLatEnabled) {
-    (void)__atomic_add_fetch(&comm->cim->dbg_seq, 1u, __ATOMIC_RELEASE);
-  }
-
   struct ibv_send_wr* bad_wr = NULL;
   uint64_t spt0 = timer_get_cycles();
   const bool singlePostKeepsImmInFirstWr = (nreqs == 1) && !needImmWr;
@@ -859,14 +988,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
 #endif
   }
 
-  if (dbgLatEnabled && !g_lat_src_set) {
-    g_lat_src_set = 1;
-    CIM_DebugLatPrinterSetWeightSource("lw", (volatile float*)comm->cim->lw, comm->base.nqps);
-    CIM_DebugLatPrinterSetSource("qp_lat(us)", (volatile uint64_t*)comm->cim->latency,
-                                 (volatile uint64_t*)comm->cim->raw_latency, comm->base.nqps);
-    CIM_DebugLatPrinterSetByteSource("bytes", (volatile uint32_t*)comm->cim->lat_bytes, comm->base.nqps);
-    CIM_DebugLatPrinterSetSyncSeq(&comm->cim->dbg_seq);
-  }
+  ibFrmFinalizeDebugPublishing(comm, dbgLatEnabled, &g_lat_src_set);
 
   return ncclSuccess;
 }
