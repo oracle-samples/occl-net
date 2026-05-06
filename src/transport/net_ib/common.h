@@ -284,6 +284,19 @@ struct ncclIbSendFifo {
 };
 
 #define QP_SIG_RING NCCL_NET_IB_MAX_RECVS
+#define NCCL_IB_QP_COLD_INVALID ((uint8_t)0xff)
+
+struct ncclIbQpColdFields {
+  // Cached local INIT attributes reused when a failed data QP is rebuilt.
+  unsigned int accessFlags;
+  // Remote pairing metadata required to drive the rebuilt QP back to RTR/RTS.
+  uint32_t remQpn;
+  int remEceSupported;
+  uint8_t ibPort;
+  // Cached remote reduced ECE parameters for data-QP rejoin.
+  struct ibv_ece remEce;
+};
+static_assert(NCCL_IB_MAX_QPS <= NCCL_IB_QP_COLD_INVALID, "ncclIbQp cold-slot index must fit in 8 bits");
 
 struct alignas(128) ncclIbQp {
   struct ibv_qp* qp;
@@ -298,22 +311,16 @@ struct alignas(128) ncclIbQp {
   uint32_t sig_tail;
   uint64_t sig_tsc[QP_SIG_RING];
   uint32_t sig_bytes[QP_SIG_RING];
-  // Cached local QP attributes used to restore INIT state during rejoin.
-  unsigned int accessFlags;
-  // Remote QP number paired with this local QP.
-  // This is required to rebuild QP state (RTR/RTS) after failures.
-  uint32_t remQpn;
-  int remEceSupported;
-  uint8_t ibPort;
-  // Cached remote reduced ECE parameters for data-QP rejoin.
-  struct ibv_ece remEce;
+  // Data QPs use this 8-bit slot to reach their cold rejoin metadata in
+  // ncclIbNetCommBase::qpCold[]. Standalone probing/flush QPs leave it invalid.
+  uint8_t coldIdx;
 };
 static_assert(alignof(struct ncclIbQp) == 128, "ncclIbQp must be 128-byte aligned");
-static_assert((sizeof(struct ncclIbQp) % 128) == 0, "ncclIbQp size must be a 128-byte multiple");
+static_assert(sizeof(struct ncclIbQp) == 128, "ncclIbQp hot shell should fit exactly in one 128-byte region");
 static_assert(offsetof(struct ncclIbQp, qp) == 0, "ncclIbQp::qp offset changed");
 static_assert(offsetof(struct ncclIbQp, sig_tsc) == 24, "ncclIbQp::sig_tsc should stay in the first 128B region");
 static_assert(offsetof(struct ncclIbQp, sig_bytes) == 88, "ncclIbQp::sig_bytes should stay in the first 128B region");
-static_assert(offsetof(struct ncclIbQp, accessFlags) == 120, "ncclIbQp::accessFlags should stay in the first 128B region");
+static_assert(offsetof(struct ncclIbQp, coldIdx) == 120, "ncclIbQp::coldIdx should stay in the first 128B region");
 
 // We need to support NCCL_NET_MAX_REQUESTS for each concurrent receive
 #define NET_IB_MAX_REQUESTS (NCCL_NET_MAX_REQUESTS*NCCL_NET_IB_MAX_RECVS)
@@ -409,6 +416,9 @@ struct alignas(128) ncclIbNetCommBase {
   int connSl;
   struct ncclIbResiliency* resiliency;
   struct ibFrmColdFields frmCold;
+  // Cold per-data-QP metadata used only during bring-up/rejoin. Keeping it
+  // out of the hot QP shell lets qps[] pack one hot object per 128B sector.
+  struct ncclIbQpColdFields qpCold[NCCL_IB_MAX_QPS];
 };
 static_assert(alignof(struct ncclIbNetCommBase) == 128, "ncclIbNetCommBase must be 128-byte aligned");
 static_assert(offsetof(struct ncclIbNetCommBase, reqs) < offsetof(struct ncclIbNetCommBase, frmFields), "reqs should stay ahead of frmFields");
@@ -417,8 +427,16 @@ static_assert(offsetof(struct ncclIbNetCommBase, remDevs) < offsetof(struct nccl
 static_assert(offsetof(struct ncclIbNetCommBase, stats) < offsetof(struct ncclIbNetCommBase, frmFields), "stats should stay ahead of frmFields");
 static_assert(offsetof(struct ncclIbNetCommBase, activeQps) > offsetof(struct ncclIbNetCommBase, frmFields), "activeQps should stay behind frmFields");
 static_assert(offsetof(struct ncclIbNetCommBase, frmCold) > offsetof(struct ncclIbNetCommBase, activeQps), "frmCold should stay behind activeQps");
+static_assert(offsetof(struct ncclIbNetCommBase, qpCold) > offsetof(struct ncclIbNetCommBase, frmCold), "qpCold should stay behind frmCold");
 
 struct ncclIbNetCommDevBase* ncclIbGetNetCommDevBase(ncclIbNetCommBase* base, int devIndex);
+
+static inline struct ncclIbQpColdFields* ncclIbCommBaseGetQpCold(struct ncclIbNetCommBase* commBase, struct ncclIbQp* qp) {
+  assert(commBase != NULL);
+  assert(qp != NULL);
+  assert(qp->coldIdx != NCCL_IB_QP_COLD_INVALID);
+  return &commBase->qpCold[qp->coldIdx];
+}
 
 // qpIndex is the index relative to a device.
 // For example, if a device has 2 QPs, qpIndex can be 0 or 1.

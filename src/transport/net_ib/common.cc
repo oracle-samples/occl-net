@@ -196,18 +196,20 @@ fail:
 ncclResult_t ncclIbBaseCommInit(struct ncclIbNetCommBase* baseComm, bool isSend) {
   memset(&baseComm->frmFields, 0, sizeof(baseComm->frmFields));
   memset(&baseComm->frmCold, 0, sizeof(baseComm->frmCold));
+  memset(&baseComm->qpCold, 0, sizeof(baseComm->qpCold));
   for (int i = 0; i < NCCL_IB_MAX_QPS; i++) {
-    baseComm->qps[i].ibPort = 0;
-    baseComm->qps[i].accessFlags = 0;
     baseComm->qps[i].devIndex= -1;
     baseComm->qps[i].remDevIdx= -1;
-    baseComm->qps[i].remQpn = 0;
-    memset(&baseComm->qps[i].remEce, 0, sizeof(baseComm->qps[i].remEce));
-    baseComm->qps[i].remEceSupported = 0;
     baseComm->qps[i].sig_head = 0;
     baseComm->qps[i].sig_tail = 0;
     memset(baseComm->qps[i].sig_tsc, 0, sizeof(baseComm->qps[i].sig_tsc));
     memset(baseComm->qps[i].sig_bytes, 0, sizeof(baseComm->qps[i].sig_bytes));
+    baseComm->qps[i].coldIdx = (uint8_t)i;
+    baseComm->qpCold[i].ibPort = 0;
+    baseComm->qpCold[i].accessFlags = 0;
+    baseComm->qpCold[i].remQpn = 0;
+    baseComm->qpCold[i].remEceSupported = 0;
+    memset(&baseComm->qpCold[i].remEce, 0, sizeof(baseComm->qpCold[i].remEce));
     baseComm->activeQps[i] = &baseComm->qps[i];
   }
   baseComm->nqps = -1;

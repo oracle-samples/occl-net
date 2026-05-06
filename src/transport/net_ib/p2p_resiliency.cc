@@ -524,14 +524,15 @@ static ncclResult_t ncclIbResiliencyTryRejoinSingleQp(struct ncclIbResiliency* r
 
   struct ncclIbResiliencyQpInfo* qpInfo = &resCtx->qpInfo[qpIndex];
   struct ncclIbQp* qp = &resCtx->baseComm->qps[qpIndex];
+  struct ncclIbQpColdFields* qpCold = ncclIbCommBaseGetQpCold(resCtx->baseComm, qp);
   uint64_t now = clockNano();
   uint64_t elapsed = now - qpInfo->lastAttemptNs;
   if (elapsed < ncclIbResiliencyQpRejoinCooldownNs()) return ncclSuccess;
   qpInfo->lastAttemptNs = now;
 
-  if (qp->remDevIdx < 0 || qp->remDevIdx >= resCtx->baseComm->nRemDevs || qp->remQpn == 0) {
+  if (qp->remDevIdx < 0 || qp->remDevIdx >= resCtx->baseComm->nRemDevs || qpCold->remQpn == 0) {
     WARN("NET/IB: %s: Skipping QP rejoin due to incomplete remote info (qpIndex=%d, remDevIdx=%d, remQpn=%u, comm=%p).",
-         __func__, qpIndex, qp->remDevIdx, qp->remQpn, resCtx->baseComm);
+         __func__, qpIndex, qp->remDevIdx, qpCold->remQpn, resCtx->baseComm);
     return ncclIbResiliencyMarkQpRejoinFailure(resCtx, qpIndex, "REMOTE_INFO");
   }
 
@@ -557,15 +558,15 @@ static ncclResult_t ncclIbResiliencyTryRejoinSingleQp(struct ncclIbResiliency* r
   if (res != ncclSuccess) {
     return ncclIbResiliencyMarkQpRejoinFailure(resCtx, qpIndex, "RESET");
   }
-  res = ibQpToInit(qp);
+  res = ibQpToInit(qp->qp, qpCold->ibPort, qpCold->accessFlags);
   if (res != ncclSuccess) {
     return ncclIbResiliencyMarkQpRejoinFailure(resCtx, qpIndex, "INIT");
   }
-  if (qp->remEceSupported) {
-    int eceSupported = qp->remEceSupported;
+  if (qpCold->remEceSupported) {
+    int eceSupported = qpCold->remEceSupported;
     INFO(NCCL_NET, "NET/IB: %s: Reapplying cached ECE while rejoining QP index %d (qp_num=%u, devIndex=%d, vendor_id=0x%x, options=0x%x, comp_mask=0x%x, comm=%p).",
-         __func__, qpIndex, qp->qp->qp_num, qp->devIndex, qp->remEce.vendor_id, qp->remEce.options, qp->remEce.comp_mask, resCtx->baseComm);
-    res = wrap_ibv_set_ece(qp->qp, &qp->remEce, &eceSupported);
+         __func__, qpIndex, qp->qp->qp_num, qp->devIndex, qpCold->remEce.vendor_id, qpCold->remEce.options, qpCold->remEce.comp_mask, resCtx->baseComm);
+    res = wrap_ibv_set_ece(qp->qp, &qpCold->remEce, &eceSupported);
     if (res != ncclSuccess) {
       return ncclIbResiliencyMarkQpRejoinFailure(resCtx, qpIndex, "ECE");
     }
@@ -574,10 +575,10 @@ static ncclResult_t ncclIbResiliencyTryRejoinSingleQp(struct ncclIbResiliency* r
            __func__, qpIndex, qp->qp->qp_num, qp->devIndex, resCtx->baseComm);
     }
   }
-  res = ncclIbRtrQp(qp->qp, &devBase->gidInfo, qp->remQpn, &remDevInfo, fifoTc, resCtx->baseComm->connTc, resCtx->baseComm->connSl);
+  res = ncclIbRtrQp(qp->qp, &devBase->gidInfo, qpCold->remQpn, &remDevInfo, fifoTc, resCtx->baseComm->connTc, resCtx->baseComm->connSl);
   if (res != ncclSuccess) {
     INFO(NCCL_NET, "NET/IB: %s: RTR failed while rejoining QP index %d (qp_num=%u, devIndex=%d, remQpn=%u, comm=%p).",
-         __func__, qpIndex, qp->qp->qp_num, qp->devIndex, qp->remQpn, resCtx->baseComm);
+         __func__, qpIndex, qp->qp->qp_num, qp->devIndex, qpCold->remQpn, resCtx->baseComm);
     return ncclIbResiliencyMarkQpRejoinFailure(resCtx, qpIndex, "RTR");
   }
   res = ncclIbRtsQp(qp->qp);
@@ -604,7 +605,7 @@ static ncclResult_t ncclIbResiliencyTryRejoinSingleQp(struct ncclIbResiliency* r
   ibResiliencyRefreshFrmQpHealth(resCtx);
   resCtx->peerReadyReadLogged = false;
   INFO(NCCL_NET, "NET/IB: %s: Locally rebuilt QP index %d (qp_num=%u, devIndex=%d, remQpn=%u, localReadyEpoch=%u, comm=%p). Waiting for peer-ready.",
-       __func__, qpIndex, qp->qp->qp_num, qp->devIndex, qp->remQpn, localEpoch, resCtx->baseComm);
+       __func__, qpIndex, qp->qp->qp_num, qp->devIndex, qpCold->remQpn, localEpoch, resCtx->baseComm);
   return ncclSuccess;
 }
 
@@ -1445,6 +1446,7 @@ ncclResult_t ncclIbResiliencySenderCreateQps(struct ncclIbResiliency* resCtx, st
     ncclIbSendCommDev* sendCommDev = &sendComm->devs[localDevIndex];
     ncclIbDev* ibDev = &ncclIbDevs[sendCommDev->base.ibDevN];
     ncclIbQp* localQp = &resCtx->probingQps[localQpIndex];
+    localQp->coldIdx = NCCL_IB_QP_COLD_INVALID;
     qpCreateAttrs.ibPort = ibDev->portNum;
     qpCreateAttrs.cq = resCtx->devs[localDevIndex].probingCq;
     qpCreateAttrs.pd = sendCommDev->base.pd;
@@ -1507,6 +1509,7 @@ ncclResult_t ncclIbResiliencyReceiverQpsCreateToRts(struct ncclIbResiliency* res
     ncclIbRecvCommDev* recvCommDev = &recvComm->devs[localDevIndex];
     ncclIbDev* ibDev = &ncclIbDevs[recvCommDev->base.ibDevN];
     ncclIbQp* localQp = &resCtx->probingQps[localQpIndex];
+    localQp->coldIdx = NCCL_IB_QP_COLD_INVALID;
     qpCreateAttrs.ibPort = ibDev->portNum;
     qpCreateAttrs.cq = resCtx->devs[localDevIndex].probingCq;
     qpCreateAttrs.pd = recvCommDev->base.pd;

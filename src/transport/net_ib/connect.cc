@@ -316,14 +316,14 @@ ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, str
 }
 
 
-ncclResult_t ibQpToInit(struct ncclIbQp* qp) {
+ncclResult_t ibQpToInit(struct ibv_qp* qp, uint8_t ibPort, unsigned int accessFlags) {
   struct ibv_qp_attr qpAttr;
   memset(&qpAttr, 0, sizeof(struct ibv_qp_attr));
   qpAttr.qp_state = IBV_QPS_INIT;
   qpAttr.pkey_index = ncclParamIbPkey();
-  qpAttr.port_num = qp->ibPort;
-  qpAttr.qp_access_flags = qp->accessFlags;
-  NCCLCHECK(wrap_ibv_modify_qp(qp->qp, &qpAttr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS));
+  qpAttr.port_num = ibPort;
+  qpAttr.qp_access_flags = accessFlags;
+  NCCLCHECK(wrap_ibv_modify_qp(qp, &qpAttr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS));
   return ncclSuccess;
 }
 
@@ -340,11 +340,7 @@ ncclResult_t ncclIbCreateQp(struct ncclIbQpCreateAttr* createQpAttrs, void* qp_c
   qpInitAttr.cap.max_recv_sge = 1;
   qpInitAttr.cap.max_inline_data = ncclParamIbUseInline() ? sizeof(struct ncclIbSendFifo) : 0;
   NCCLCHECK(wrap_ibv_create_qp(&qp->qp, createQpAttrs->pd, &qpInitAttr));
-  qp->ibPort = createQpAttrs->ibPort;
-  qp->accessFlags = createQpAttrs->accessFlags;
-  memset(&qp->remEce, 0, sizeof(qp->remEce));
-  qp->remEceSupported = 0;
-  NCCLCHECK(ibQpToInit(qp));
+  NCCLCHECK(ibQpToInit(qp->qp, createQpAttrs->ibPort, createQpAttrs->accessFlags));
   return ncclSuccess;
 }
 
@@ -473,6 +469,12 @@ static ncclResult_t ncclIbSenderQpsCreate(ncclIbSendComm* comm, struct ncclIbCon
         (uint16_t)ncclParamIbPkey(),
         commDev->base.pd);
     localQp->devIndex = devIndex;
+    struct ncclIbQpColdFields* localQpCold = ncclIbCommBaseGetQpCold(&comm->base, localQp);
+    localQpCold->ibPort = qpCreateAttrs.ibPort;
+    localQpCold->accessFlags = qpCreateAttrs.accessFlags;
+    localQpCold->remQpn = 0;
+    localQpCold->remEceSupported = 0;
+    memset(&localQpCold->remEce, 0, sizeof(localQpCold->remEce));
 
     // Populate the metadata that will be delivered to the remote peer
     localQpInfo->qpn      = localQp->qp->qp_num;
@@ -504,18 +506,19 @@ static ncclResult_t ncclIbSenderQpsToRts(ncclIbSendComm* comm, struct ncclIbConn
   uint nqps = comm->base.nqps;
   for (int qpIndex = 0; qpIndex < nqps; qpIndex++) {
     ncclIbQp* localQp = &comm->base.qps[qpIndex];
+    struct ncclIbQpColdFields* localQpCold = ncclIbCommBaseGetQpCold(&comm->base, localQp);
     ncclIbSendCommDev* commDev = &comm->devs[localQp->devIndex];
     ncclIbDev* ibDev = &ncclIbDevs[commDev->base.ibDevN];
     ncclIbQpInfo* remQpInfo   = &remMeta->qpInfo[qpIndex];
     ncclIbDevInfo* remDevInfo = &remMeta->devs[remQpInfo->devIndex];
 
     localQp->remDevIdx = remQpInfo->devIndex;
-    localQp->remQpn = remQpInfo->qpn;
-    localQp->remEceSupported = remQpInfo->ece_supported;
+    localQpCold->remQpn = remQpInfo->qpn;
+    localQpCold->remEceSupported = remQpInfo->ece_supported;
     if (remQpInfo->ece_supported) {
-      localQp->remEce = remQpInfo->ece;
+      localQpCold->remEce = remQpInfo->ece;
     } else {
-      memset(&localQp->remEce, 0, sizeof(localQp->remEce));
+      memset(&localQpCold->remEce, 0, sizeof(localQpCold->remEce));
     }
 
     if (remQpInfo->ece_supported) {
@@ -893,16 +896,7 @@ static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
     int remDevIndex = remQpInfo->devIndex;
     ncclIbDevInfo* remDevInfo = &remMeta->devs[remDevIndex];
     ncclIbQp* localQp = &rComm->base.qps[qpIndex];
-
-    localQp->remDevIdx = remDevIndex;
-    localQp->remQpn = remQpInfo->qpn;
-    localQp->devIndex = devIndex;
-    localQp->remEceSupported = remQpInfo->ece_supported;
-    if (remQpInfo->ece_supported) {
-      localQp->remEce = remQpInfo->ece;
-    } else {
-      memset(&localQp->remEce, 0, sizeof(localQp->remEce));
-    }
+    struct ncclIbQpColdFields* localQpCold = ncclIbCommBaseGetQpCold(&rComm->base, localQp);
 
     qpCreateAttrs.ibPort = ibDev->portNum;
     qpCreateAttrs.cq = rCommDev->base.cq;
@@ -911,6 +905,17 @@ static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
       ncclIbResiliencyDataRqSizeGet(rComm->base.resiliency, devIndex, &qpCreateAttrs.maxRecvWorkRequest);
     }
     NCCLCHECK(ncclIbCreateQp(&qpCreateAttrs, &rComm->base.stats, localQp));
+    localQp->remDevIdx = remDevIndex;
+    localQp->devIndex = devIndex;
+    localQpCold->remQpn = remQpInfo->qpn;
+    localQpCold->remEceSupported = remQpInfo->ece_supported;
+    localQpCold->ibPort = qpCreateAttrs.ibPort;
+    localQpCold->accessFlags = qpCreateAttrs.accessFlags;
+    if (remQpInfo->ece_supported) {
+      localQpCold->remEce = remQpInfo->ece;
+    } else {
+      memset(&localQpCold->remEce, 0, sizeof(localQpCold->remEce));
+    }
     INFO(NCCL_NET, "NET/IB: %s: QP created: port=%d dev=%d devName=%s ndevs=%d nmdevs=%d qp_num=%u pkey=%u pd=%p",
         __func__,
         ibDev->portNum,
@@ -959,6 +964,7 @@ static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
       qpCreateAttrs.accessFlags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ;
       qpCreateAttrs.maxRecvWorkRequest = 0;
       qpCreateAttrs.maxSendWorkRequest = NET_IB_MAX_REQUESTS;
+      rCommDev->gpuFlush.qp.coldIdx = NCCL_IB_QP_COLD_INVALID;
       NCCLCHECK(ncclIbCreateQp(&qpCreateAttrs, &rComm->base.stats, &rCommDev->gpuFlush.qp));
       INFO(NCCL_NET, "NET/IB: %s: QP created: port=%d dev=%d devName=%s ndevs=%d nmdevs=%d qp_num=%u pkey=%u pd=%p",
           __func__,
