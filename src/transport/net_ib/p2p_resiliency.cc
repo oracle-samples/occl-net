@@ -17,7 +17,24 @@ NCCL_PARAM(IbResiliencyPortFailoverProbeDelay, "IB_RESILIENCY_PORT_FAILOVER_PROB
 #define IB_RESILIENCY_READY_QP_WORDS ((NCCL_IB_MAX_QPS + 63) / 64)
 #define IB_RESILIENCY_PEER_READY_WR_ID ((uint64_t)(NET_IB_MAX_REQUESTS + 0x2000))
 #define IB_RESILIENCY_PROBE_WR_ID_BASE (1ULL << 61)
+#define IB_RESILIENCY_PROBE_WR_ID_STRIDE ((uint64_t)IB_SEND_REQ_WR_ID_SLOT_MASK + 1ULL)
 #define IB_RESILIENCY_QP_REJOIN_MAX_FAILURES 16
+
+static_assert((IB_RESILIENCY_PROBE_WR_ID_BASE & IB_SEND_REQ_WR_ID_SLOT_MASK) == 0, "probe wr_id base must leave slot bits clear");
+static_assert((IB_RESILIENCY_PROBE_WR_ID_BASE & IB_REQ_WR_ID_FLAG) == 0, "probe wr_id base must not collide with request wr_id flag");
+
+// Probe completions arrive on a dedicated CQ, so we can use the low wr_id bits
+// to point back at the failed-request slot and still keep a wider token in the
+// upper bits for stale completion rejection.
+static inline uint64_t ibResiliencyProbeWrIdEncode(uint64_t probeWrIdBase, uint64_t slot) {
+  assert((probeWrIdBase & IB_SEND_REQ_WR_ID_SLOT_MASK) == 0);
+  assert(slot < NET_IB_MAX_REQUESTS);
+  return probeWrIdBase | slot;
+}
+
+static inline uint64_t ibResiliencyProbeWrIdDecodeSlot(uint64_t wrId) {
+  return wrId & IB_SEND_REQ_WR_ID_SLOT_MASK;
+}
 
 static ncclResult_t ncclIbResiliencyProbeHandleCompletionEvent(struct ncclIbResiliencySend* sendResCtx, struct ibv_wc* probeWc, int devIndex);
 static ncclResult_t ncclIbResiliencyHandleDeviceFailure(struct ncclIbResiliency* resCtx, int devIndex);
@@ -1060,7 +1077,8 @@ static ncclResult_t ncclIbResiliencyProbePost(struct ncclIbResiliencySend* sendR
   probeWr.sg_list = &sge;
   probeWr.num_sge = 1;
   probeWr.opcode = IBV_WR_RDMA_READ;
-  probeWr.wr_id = sendResCtx->nextProbeWrId++;
+  probeWr.wr_id = ibResiliencyProbeWrIdEncode(sendResCtx->nextProbeWrId, slot);
+  sendResCtx->nextProbeWrId += IB_RESILIENCY_PROBE_WR_ID_STRIDE;
   probeWr.send_flags = IBV_SEND_SIGNALED;
   probeWr.next = NULL;
 
@@ -1087,15 +1105,9 @@ static ncclResult_t ncclIbResiliencyProbeHandleCompletionEvent(struct ncclIbResi
 
   TRACE(NCCL_NET, "NET/IB: %s: Got probing completion (devIndex=%d, wc->status=%d, wc->opcode=%d, wc->wr_id=%ld, wc->qp_num=%u)", __func__, devIndex, probeWc->status, probeWc->opcode, probeWc->wr_id, probeWc->qp_num);
 
-  struct ncclIbResiliencyRequestSend* failedRequest = NULL;
-  int failedSlot = -1;
-  for (int slot = 0; slot < NET_IB_MAX_REQUESTS; slot++) {
-    if (sendResCtx->failedRequests[slot].probeWrId != probeWc->wr_id) continue;
-    failedRequest = &sendResCtx->failedRequests[slot];
-    failedSlot = slot;
-    break;
-  }
-  if (failedRequest == NULL || failedRequest->request == NULL) {
+  int failedSlot = (int)ibResiliencyProbeWrIdDecodeSlot(probeWc->wr_id);
+  struct ncclIbResiliencyRequestSend* failedRequest = &sendResCtx->failedRequests[failedSlot];
+  if (failedRequest->probeWrId != probeWc->wr_id || failedRequest->request == NULL) {
     TRACE(NCCL_NET, "NET/IB: %s: Ignoring stale probe completion with no live failed request bound to wr_id=%ld (comm=%p, devIndex=%d, qp_num=%u).",
           __func__, probeWc->wr_id, sendResCtx->base.baseComm, devIndex, probeWc->qp_num);
     return ncclSuccess;

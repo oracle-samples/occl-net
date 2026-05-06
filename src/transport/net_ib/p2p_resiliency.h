@@ -213,7 +213,8 @@ struct alignas(128) ncclIbResiliencySend {
   // Stores information, per-device, used to access the completion records
   // structure on the receiver side.
   struct ncclIbResiliencyRemoteCompletionRecordsInfo remCmplRecordsInfo[NCCL_IB_MAX_DEVS_PER_NIC];
-  // Monotonic token source for uniquely identifying probe completions.
+  // Monotonic probe wr_id base; the low slot bits stay clear so each probe can
+  // encode its failed-request slot directly in the posted wr_id.
   uint64_t nextProbeWrId;
 };
 static_assert(alignof(struct ncclIbResiliencySend) == 128, "ncclIbResiliencySend must be 128-byte aligned");
