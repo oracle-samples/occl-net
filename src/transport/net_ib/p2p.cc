@@ -34,12 +34,6 @@ static inline uint64_t wrid_pack_with_qp(uint64_t req_pack, uint32_t qpIndex) {
   return req_pack;
 }
 
-static inline int wrid_unpack_qp(uint64_t wr_id, int* has_qp) {
-  (void)wr_id;
-  if (has_qp) *has_qp = 0;
-  return -1;
-}
-
 static inline uint64_t ibFrmSpreadEpsUs() {
   static const uint64_t eps = []() -> uint64_t {
     const int64_t value = ncclParamFrmSpreadEpsUs();
@@ -1439,11 +1433,7 @@ static inline void ibFrmUpdateLatencyStamp(struct ncclIbRequest* req, struct ibv
   if (req == NULL || req->base == NULL || wc == NULL) return;
   if (wc->opcode != IBV_WC_RDMA_WRITE) return;
 
-  int has_qp_flag = 0;
-  int qpIndex = wrid_unpack_qp(wc->wr_id, &has_qp_flag);
-  if (!has_qp_flag) {
-    qpIndex = qpMapFind(&req->base->frmFields.qpHash, wc->qp_num);
-  }
+  int qpIndex = qpMapFind(&req->base->frmFields.qpHash, wc->qp_num);
   if ((unsigned)qpIndex >= (unsigned)req->base->nqps) return;
 
   static const uint8_t kZeroStampHoldoff = []() -> uint8_t {
