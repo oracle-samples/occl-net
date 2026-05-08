@@ -1350,8 +1350,16 @@ static inline ncclResult_t ncclIbRequestRetrieveFromCompletion(struct ncclIbNetC
 }
 
 static inline bool ncclIbRequestIsComplete(struct ncclIbRequest *request) {
-  bool complete = (request->events[0] == 0 && request->events[1] == 0 && request->events[2] == 0 && request->events[3] == 0);
+  const int ev0 = request->events[0];
+  const int ev1 = request->events[1];
+  const int ev2 = request->events[2];
+  const int ev3 = request->events[3];
+  bool complete = (ev0 == 0 && ev1 == 0 && ev2 == 0 && ev3 == 0);
   if (!complete && request->base->resiliency) {
+    // Healthy resiliency keeps request event counters non-negative. The slow
+    // helper is only needed once failover introduces negative rebalanced
+    // counters that can satisfy the alternate completion condition.
+    if (__builtin_expect((ev0 | ev1 | ev2 | ev3) >= 0, 1)) return false;
     NCCLCHECK(ncclIbResiliencyRequestIsComplete(request, &complete));
   }
   return complete;
