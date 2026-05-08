@@ -56,6 +56,10 @@ static inline void ibFrmFlushTelemetry(struct ncclIbSendComm* comm) {
     memset(comm->cim->latency, 0, sizeof(comm->cim->latency));
     memset(comm->cim->raw_latency, 0, sizeof(comm->cim->raw_latency));
     memset(comm->cim->lat_bytes, 0, sizeof(comm->cim->lat_bytes));
+    comm->cim->dbg_view_count = (uint32_t)comm->cim->nqps;
+    for (int i = 0; i < comm->cim->nqps; i++) {
+      comm->cim->dbg_view_qp_index[i] = (uint32_t)i;
+    }
   }
 
   if (dbgLatEnabled) {
@@ -149,6 +153,17 @@ static inline int ibQpSigPop(ncclIbQp* qp, uint64_t* out_t0, uint32_t* out_bytes
   return 1;
 }
 
+static inline void ibFrmPublishDebugView(struct ncclIbSendComm* comm, int viewCount, bool split, int activeBaseIx) {
+  if (comm == NULL || comm->cim == NULL) return;
+
+  if (viewCount < 0) viewCount = 0;
+  if (viewCount > comm->cim->nqps) viewCount = comm->cim->nqps;
+  comm->cim->dbg_view_count = (uint32_t)viewCount;
+  for (int i = 0; i < viewCount; i++) {
+    comm->cim->dbg_view_qp_index[i] = (uint32_t)(split ? i : ((activeBaseIx + i) % comm->base.nqps));
+  }
+}
+
 static inline void ibFrmFinalizeDebugPublishing(struct ncclIbSendComm* comm, bool dbgLatEnabled, int* g_lat_src_set) {
   if (!dbgLatEnabled || comm == NULL || comm->cim == NULL) return;
 
@@ -160,6 +175,7 @@ static inline void ibFrmFinalizeDebugPublishing(struct ncclIbSendComm* comm, boo
   CIM_DebugLatPrinterSetSource("qp_lat(us)", (volatile uint64_t*)comm->cim->latency,
                                (volatile uint64_t*)comm->cim->raw_latency, comm->base.nqps);
   CIM_DebugLatPrinterSetByteSource("bytes", (volatile uint32_t*)comm->cim->lat_bytes, comm->base.nqps);
+  CIM_DebugLatPrinterSetViewSource(&comm->cim->dbg_view_count, comm->cim->dbg_view_qp_index);
   CIM_DebugLatPrinterSetSyncSeq(&comm->cim->dbg_seq);
 }
 
@@ -562,6 +578,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
 
   if (dbgLatEnabled) {
     (void)__atomic_add_fetch(&comm->cim->dbg_seq, 1u, __ATOMIC_RELEASE);
+    ibFrmPublishDebugView(comm, nqps, split, activeBaseIx);
   }
 
   // FRM-only single-request sends dominate the hot path. Post them directly

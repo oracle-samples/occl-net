@@ -18,6 +18,8 @@ struct CIMState {
     int      running;               // thread loop flag
     pthread_t thread;
     volatile uint32_t dbg_seq;      // seqlock for coherent debug snapshots
+    uint32_t dbg_view_count;        // number of debug entries to render
+    uint32_t dbg_view_qp_index[CIM_MAX_QPS]; // debug slot -> global QP index
     float    lw[CIM_MAX_QPS];       // per-QP load weight (0..1)
     uint64_t latency[CIM_MAX_QPS];  // Cache latency in cim
     uint64_t raw_latency[CIM_MAX_QPS]; // Cache raw latency before norm
@@ -49,6 +51,8 @@ void CIM_DebugLatPrinterSetByteSource(const char* label,
                                       volatile uint32_t* bytes,
                                       int nqps);
 void CIM_DebugLatPrinterSetSyncSeq(volatile uint32_t* seq);
+void CIM_DebugLatPrinterSetViewSource(volatile uint32_t* viewCount,
+                                      volatile uint32_t* viewQpIndex);
 
 /* -------------------- Option B timer: cycle accumulation -------------------- */
 

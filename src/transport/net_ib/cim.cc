@@ -75,6 +75,8 @@ CIMState* CIM_Start(int nqps) {
   if (!s) return NULL;
   memset(s, 0, sizeof(*s));
   s->nqps = nqps;
+  s->dbg_view_count = (uint32_t)nqps;
+  for (int i = 0; i < nqps; i++) s->dbg_view_qp_index[i] = (uint32_t)i;
   s->seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
 
   // Deterministic one-time init (no background thread).
@@ -120,6 +122,8 @@ static volatile float* g_lw_ptr = NULL;
 static int g_lw_nqps = 0;
 static char g_lw_label[64] = "lw";
 static volatile uint32_t* g_dbg_seq_ptr = NULL;
+static volatile uint32_t* g_dbg_view_count_ptr = NULL;
+static volatile uint32_t* g_dbg_view_qp_index_ptr = NULL;
 
 // Load float via 32-bit atomic load to avoid torn reads (debug-safe)
 static inline float load_float_relaxed(const volatile float* p) {
@@ -134,6 +138,8 @@ typedef struct {
   uint64_t raw[CIM_MAX_QPS];
   uint32_t bytes[CIM_MAX_QPS];
   float lw[CIM_MAX_QPS];
+  uint32_t view_count;
+  uint32_t view_qp_index[CIM_MAX_QPS];
 } CIMDebugSnapshot;
 
 static inline int cimDbgFloatDiffers(float a, float b) {
@@ -149,6 +155,8 @@ static void cimDbgCaptureSnapshot(CIMDebugSnapshot* out,
                                   volatile float* lw,
                                   int lw_nqps,
                                   volatile uint32_t* seqp,
+                                  volatile uint32_t* viewCountp,
+                                  volatile uint32_t* viewQpIndexp,
                                   int nqps) {
   while (1) {
     uint32_t s0 = 0, s1 = 0;
@@ -162,6 +170,17 @@ static void cimDbgCaptureSnapshot(CIMDebugSnapshot* out,
       out->raw[i] = rlat ? __atomic_load_n(&rlat[i], __ATOMIC_RELAXED) : 0;
       out->bytes[i] = bytes ? __atomic_load_n(&bytes[i], __ATOMIC_RELAXED) : 0;
       out->lw[i] = (lw && i < lw_nqps) ? load_float_relaxed(&lw[i]) : 0.0f;
+    }
+
+    uint32_t viewCount = (uint32_t)nqps;
+    if (viewCountp != NULL) {
+      uint32_t loaded = __atomic_load_n(viewCountp, __ATOMIC_RELAXED);
+      if (loaded != 0 && loaded <= (uint32_t)nqps) viewCount = loaded;
+    }
+    out->view_count = viewCount;
+    for (uint32_t i = 0; i < viewCount; i++) {
+      uint32_t qpIndex = viewQpIndexp != NULL ? __atomic_load_n(&viewQpIndexp[i], __ATOMIC_RELAXED) : i;
+      out->view_qp_index[i] = qpIndex < (uint32_t)nqps ? qpIndex : i;
     }
 
     if (!seqp) break;
@@ -210,6 +229,8 @@ static void cimDbgCommitLastSnapshot(const CIMDebugSnapshot* snap,
                                      uint64_t* last_raw,
                                      uint32_t* last_bytes,
                                      float* last_lw,
+                                     uint32_t* last_view_count,
+                                     uint32_t* last_view_qp_index,
                                      int nqps,
                                      int hasLat,
                                      int hasRaw,
@@ -221,6 +242,25 @@ static void cimDbgCommitLastSnapshot(const CIMDebugSnapshot* snap,
     if (hasBytes) last_bytes[i] = snap->bytes[i];
     if (hasLw) last_lw[i] = snap->lw[i];
   }
+  *last_view_count = snap->view_count;
+  for (uint32_t i = 0; i < snap->view_count; i++) {
+    last_view_qp_index[i] = snap->view_qp_index[i];
+  }
+}
+
+static inline int cimDbgViewCount(const CIMDebugSnapshot* snap, int nqps) {
+  int viewCount = (snap->view_count == 0) ? nqps : (int)snap->view_count;
+  if (viewCount < 0) viewCount = 0;
+  if (viewCount > nqps) viewCount = nqps;
+  if (viewCount > CIM_MAX_QPS) viewCount = CIM_MAX_QPS;
+  return viewCount;
+}
+
+static inline int cimDbgViewQpIndex(const CIMDebugSnapshot* snap, int slot, int nqps) {
+  const int viewCount = cimDbgViewCount(snap, nqps);
+  if (slot < 0 || slot >= viewCount) return slot;
+  const uint32_t qpIndex = snap->view_qp_index[slot];
+  return qpIndex < (uint32_t)nqps ? (int)qpIndex : slot;
 }
 
 static void cimDbgPrintSnapshot(const char* tag,
@@ -310,69 +350,74 @@ static void cimDbgPrintSnapshot(const char* tag,
     }
   }
 
-  for (int i = 0; i < nqps; i++) {
+  const int viewCount = cimDbgViewCount(snap, nqps);
+  for (int i = 0; i < viewCount; i++) {
+    const int qpIndex = cimDbgViewQpIndex(snap, i, nqps);
     if (hasLat && hasRaw && hasBytes) {
       if (hasLw) {
         fprintf(stdout, "q%d=%lu(raw=%lu,bytes=%u,w=%.4f) ",
-                i,
-                (unsigned long)snap->lat[i],
-                (unsigned long)snap->raw[i],
-                snap->bytes[i],
-                snap->lw[i]);
+                qpIndex,
+                (unsigned long)snap->lat[qpIndex],
+                (unsigned long)snap->raw[qpIndex],
+                snap->bytes[qpIndex],
+                snap->lw[qpIndex]);
       } else {
         fprintf(stdout, "q%d=%lu(raw=%lu,bytes=%u) ",
-                i,
-                (unsigned long)snap->lat[i],
-                (unsigned long)snap->raw[i],
-                snap->bytes[i]);
+                qpIndex,
+                (unsigned long)snap->lat[qpIndex],
+                (unsigned long)snap->raw[qpIndex],
+                snap->bytes[qpIndex]);
       }
     } else if (hasLat && hasRaw) {
       if (hasLw) {
         fprintf(stdout, "q%d=%lu(raw=%lu,w=%.4f) ",
-                i, (unsigned long)snap->lat[i], (unsigned long)snap->raw[i], snap->lw[i]);
+                qpIndex,
+                (unsigned long)snap->lat[qpIndex],
+                (unsigned long)snap->raw[qpIndex],
+                snap->lw[qpIndex]);
       } else {
         fprintf(stdout, "q%d=%lu(raw=%lu) ",
-                i, (unsigned long)snap->lat[i], (unsigned long)snap->raw[i]);
+                qpIndex, (unsigned long)snap->lat[qpIndex], (unsigned long)snap->raw[qpIndex]);
       }
     } else if (hasLat && hasBytes) {
       if (hasLw) {
         fprintf(stdout, "q%d=%lu(bytes=%u,w=%.4f) ",
-                i, (unsigned long)snap->lat[i], snap->bytes[i], snap->lw[i]);
+                qpIndex, (unsigned long)snap->lat[qpIndex], snap->bytes[qpIndex], snap->lw[qpIndex]);
       } else {
         fprintf(stdout, "q%d=%lu(bytes=%u) ",
-                i, (unsigned long)snap->lat[i], snap->bytes[i]);
+                qpIndex, (unsigned long)snap->lat[qpIndex], snap->bytes[qpIndex]);
       }
     } else if (hasLat) {
       if (hasLw) {
         fprintf(stdout, "q%d=%lu(w=%.4f) ",
-                i, (unsigned long)snap->lat[i], snap->lw[i]);
+                qpIndex, (unsigned long)snap->lat[qpIndex], snap->lw[qpIndex]);
       } else {
         fprintf(stdout, "q%d=%lu ",
-                i, (unsigned long)snap->lat[i]);
+                qpIndex, (unsigned long)snap->lat[qpIndex]);
       }
     } else if (hasRaw && hasBytes) {
       if (hasLw) {
         fprintf(stdout, "q%d=%lu(bytes=%u,w=%.4f) ",
-                i, (unsigned long)snap->raw[i], snap->bytes[i], snap->lw[i]);
+                qpIndex, (unsigned long)snap->raw[qpIndex], snap->bytes[qpIndex], snap->lw[qpIndex]);
       } else {
         fprintf(stdout, "q%d=%lu(bytes=%u) ",
-                i, (unsigned long)snap->raw[i], snap->bytes[i]);
+                qpIndex, (unsigned long)snap->raw[qpIndex], snap->bytes[qpIndex]);
       }
     } else if (hasRaw) {
       if (hasLw) {
         fprintf(stdout, "q%d=%lu(w=%.4f) ",
-                i, (unsigned long)snap->raw[i], snap->lw[i]);
+                qpIndex, (unsigned long)snap->raw[qpIndex], snap->lw[qpIndex]);
       } else {
         fprintf(stdout, "q%d=%lu ",
-                i, (unsigned long)snap->raw[i]);
+                qpIndex, (unsigned long)snap->raw[qpIndex]);
       }
     } else if (hasBytes) {
       if (hasLw) {
         fprintf(stdout, "q%d=%u(w=%.4f) ",
-                i, snap->bytes[i], snap->lw[i]);
+                qpIndex, snap->bytes[qpIndex], snap->lw[qpIndex]);
       } else {
         fprintf(stdout, "q%d=%u ",
-                i, snap->bytes[i]);
+                qpIndex, snap->bytes[qpIndex]);
       }
     }
   }
@@ -393,6 +438,9 @@ static void* lat_printer_thread(void* _) {
 
   float last_lw[CIM_MAX_QPS];
   for (int i = 0; i < CIM_MAX_QPS; i++) last_lw[i] = -1.0f;
+  uint32_t last_view_count = 0;
+  uint32_t last_view_qp_index[CIM_MAX_QPS];
+  memset(last_view_qp_index, 0, sizeof(last_view_qp_index));
   int haveLast = 0;
 
   while (1) {
@@ -414,6 +462,8 @@ static void* lat_printer_thread(void* _) {
     int lw_nqps = 0;
     char lwlabel[64];
     volatile uint32_t* seqp = NULL;
+    volatile uint32_t* viewCountp = NULL;
+    volatile uint32_t* viewQpIndexp = NULL;
 
     pthread_mutex_lock(&g_lat_mu);
     lat  = g_lat_ptr;
@@ -433,6 +483,8 @@ static void* lat_printer_thread(void* _) {
     lw = g_lw_ptr;
     lw_nqps = g_lw_nqps;
     seqp = g_dbg_seq_ptr;
+    viewCountp = g_dbg_view_count_ptr;
+    viewQpIndexp = g_dbg_view_qp_index_ptr;
 
     strncpy(lwlabel, g_lw_label, sizeof(lwlabel));
     lwlabel[sizeof(lwlabel)-1] = 0;
@@ -452,10 +504,11 @@ static void* lat_printer_thread(void* _) {
     const int hasLw = (lw != NULL && lw_nqps > 0);
 
     CIMDebugSnapshot snap;
-    cimDbgCaptureSnapshot(&snap, lat, rlat, bytes, lw, lw_nqps, seqp, nqps);
+    cimDbgCaptureSnapshot(&snap, lat, rlat, bytes, lw, lw_nqps, seqp, viewCountp, viewQpIndexp, nqps);
 
     if (!haveLast) {
       cimDbgCommitLastSnapshot(&snap, last, last_raw, last_bytes, last_lw,
+                               &last_view_count, last_view_qp_index,
                                nqps, hasLat, hasRaw, hasBytes, hasLw);
       haveLast = 1;
       msleep(g_lat_interval_ms);
@@ -470,12 +523,17 @@ static void* lat_printer_thread(void* _) {
         prev.bytes[i] = last_bytes[i];
         prev.lw[i] = last_lw[i];
       }
+      prev.view_count = last_view_count;
+      for (uint32_t i = 0; i < last_view_count; i++) {
+        prev.view_qp_index[i] = last_view_qp_index[i];
+      }
 
       cimDbgPrintSnapshot("[0]", label, rlabel, bytesLabel, lwlabel, &prev,
                           nqps, hasLat, hasRaw, hasBytes, hasLw);
       cimDbgPrintSnapshot("[1]", label, rlabel, bytesLabel, lwlabel, &snap,
                           nqps, hasLat, hasRaw, hasBytes, hasLw);
       cimDbgCommitLastSnapshot(&snap, last, last_raw, last_bytes, last_lw,
+                               &last_view_count, last_view_qp_index,
                                nqps, hasLat, hasRaw, hasBytes, hasLw);
       fflush(stdout);
     }
@@ -535,6 +593,8 @@ void CIM_DebugLatPrinterStop(void) {
   g_lw_ptr = NULL;
   g_lw_nqps = 0;
   g_dbg_seq_ptr = NULL;
+  g_dbg_view_count_ptr = NULL;
+  g_dbg_view_qp_index_ptr = NULL;
   pthread_mutex_unlock(&g_lat_mu);
 }
 
@@ -613,5 +673,13 @@ void CIM_DebugLatPrinterSetByteSource(const char* label,
 void CIM_DebugLatPrinterSetSyncSeq(volatile uint32_t* seq) {
   pthread_mutex_lock(&g_lat_mu);
   g_dbg_seq_ptr = seq;
+  pthread_mutex_unlock(&g_lat_mu);
+}
+
+void CIM_DebugLatPrinterSetViewSource(volatile uint32_t* viewCount,
+                                      volatile uint32_t* viewQpIndex) {
+  pthread_mutex_lock(&g_lat_mu);
+  g_dbg_view_count_ptr = viewCount;
+  g_dbg_view_qp_index_ptr = viewQpIndex;
   pthread_mutex_unlock(&g_lat_mu);
 }
