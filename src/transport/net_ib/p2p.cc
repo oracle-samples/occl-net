@@ -19,21 +19,13 @@ enum ncclIbRequestMatchingScheme {
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 // By default, use ncclIbRequestMatchingScheme::BY_INDEX matching scheme.
 NCCL_PARAM(IbReceiverSideMatchingScheme, "IB_RECEIVER_SIDE_MATCHING_SCHEME", 0);
-NCCL_PARAM(FrmSpreadEpsUs, "FRM_SPREAD_EPS_US", 2);
+NCCL_PARAM(FrmSpreadEpsUs, "FRM_SPREAD_EPS_US", 4);
 NCCL_PARAM(FrmZeroStampHoldoff, "FRM_ZERO_STAMP_HOLDOFF", 2);
 
 #define FRM_LAT_NORM_MTU_BYTES 4096u
 #define FRM_LAT_NORM_HALF_MTU_BYTES 2048u
 
 static constexpr int kIbMultiSendAlign = 128;
-
-static inline uint64_t ibFrmSpreadEpsUs() {
-  static const uint64_t eps = []() -> uint64_t {
-    const int64_t value = ncclParamFrmSpreadEpsUs();
-    return value < 0 ? 2ULL : (uint64_t)value;
-  }();
-  return eps;
-}
 
 static inline bool ibFrmResiliencyHealthy(const struct ncclIbNetCommBase* base) {
   if (base == NULL || base->resiliency == NULL) return true;
@@ -515,6 +507,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
   float* lwArr = scratch->lwPerQp;
   bool bypassEqual = false;
   {
+    const uint64_t spreadEpsUs = comm->cim->spread_eps_us;
     uint64_t minLat = UINT64_MAX;
     uint64_t maxLat = 0;
     const int count = split ? nqps : comm->base.nDataQps;
@@ -525,7 +518,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       if (v < minLat) minLat = v;
       if (v > maxLat) maxLat = v;
     }
-    if (minLat == UINT64_MAX || (maxLat - minLat) <= ibFrmSpreadEpsUs()) {
+    if (minLat == UINT64_MAX || (maxLat - minLat) <= spreadEpsUs) {
       bypassEqual = true;
     }
   }

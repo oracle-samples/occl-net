@@ -14,6 +14,7 @@ typedef struct CIMState CIMState;
 
 struct CIMState {
     int      nqps;                  // number of QPs for this comm
+    uint64_t spread_eps_us;         // cached FRM equal-spread deadband for this comm
     int      running;               // thread loop flag
     pthread_t thread;
     volatile uint32_t dbg_seq;      // seqlock for coherent debug snapshots

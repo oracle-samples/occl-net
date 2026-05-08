@@ -9,6 +9,8 @@
 #include "common.h"
 #include "p2p_resiliency.h"
 
+extern int64_t ncclParamFrmSpreadEpsUs();
+
 NCCL_PARAM(IbGidIndex, "IB_GID_INDEX", -1);
 NCCL_PARAM(IbRoutableFlidIbGidIndex, "IB_ROUTABLE_FLID_GID_INDEX", 1);
 NCCL_PARAM(IbRoceVersionNum, "IB_ROCE_VERSION_NUM", 2);
@@ -20,6 +22,17 @@ NCCL_PARAM(IbSl, "IB_SL", -1);
 NCCL_PARAM(IbTc, "IB_TC", -1);
 NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", -1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
+
+static inline uint64_t ibFrmResolveSpreadEpsUs(const struct ncclIbSendComm* comm) {
+  const int64_t value = ncclParamFrmSpreadEpsUs();
+  uint64_t eps = value < 0 ? 2ULL : (uint64_t)value;
+  if (comm == NULL) return eps;
+  if (comm->base.resiliency == NULL) return eps;
+  if (comm->base.splitDataOnQps != 0) return eps;
+  if (comm->base.nDataQps != 2) return eps;
+  if (comm->base.nqps < 8) return eps;
+  return eps < 7ULL ? 7ULL : eps;
+}
 
 enum ncclIbCommState {
   ncclIbCommStateStart = 0,
@@ -772,6 +785,7 @@ ib_connect:
   if (useFrm) {
     comm->cim = CIM_Start(comm->base.nqps);
     if (comm->cim != NULL) {
+      comm->cim->spread_eps_us = ibFrmResolveSpreadEpsUs(comm);
       for (int q = 0; q < comm->base.nqps; q++) {
         comm->base.qps[q].sig_head = 0;
         comm->base.qps[q].sig_tail = 0;
