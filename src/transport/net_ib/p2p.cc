@@ -40,10 +40,10 @@ static inline void ibFrmFlushTelemetry(struct ncclIbSendComm* comm) {
     (void)__atomic_add_fetch(&comm->cim->dbg_seq, 1u, __ATOMIC_RELEASE);
   }
 
-  memset(comm->base.frmFields.qp_lat, 0, sizeof(comm->base.frmFields.qp_lat));
+  memset(comm->base.frmFields.send.qp_lat, 0, sizeof(comm->base.frmFields.send.qp_lat));
   memset(comm->base.frmCold.qp_raw_lat, 0, sizeof(comm->base.frmCold.qp_raw_lat));
   memset(comm->base.frmCold.qp_lat_bytes, 0, sizeof(comm->base.frmCold.qp_lat_bytes));
-  memset(comm->base.frmFields.qp_zero_stamp_holdoff, 0, sizeof(comm->base.frmFields.qp_zero_stamp_holdoff));
+  memset(comm->base.frmFields.completion.qp_zero_stamp_holdoff, 0, sizeof(comm->base.frmFields.completion.qp_zero_stamp_holdoff));
   for (int qpIndex = 0; qpIndex < comm->base.nqps; qpIndex++) {
     ncclIbQp* qp = &comm->base.qps[qpIndex];
     qp->sig_tail = qp->sig_head;
@@ -110,14 +110,14 @@ static inline void ibFrmComputeLw(struct ncclIbSendComm* comm, int nqps, float* 
 
   int is_equal = 0;
   if (split) {
-    CIM_latencyToWeightsDirect(comm->base.frmFields.qp_lat, nqps, lwArr, &is_equal);
+    CIM_latencyToWeightsDirect(comm->base.frmFields.send.qp_lat, nqps, lwArr, &is_equal);
     if (is_equal) {
       return;
     }
     return;
   }
 
-  CIM_computeActiveWindowWeights(comm->base.frmFields.qp_lat, baseN, curQpIndex, nDataQ, lwArr);
+  CIM_computeActiveWindowWeights(comm->base.frmFields.send.qp_lat, baseN, curQpIndex, nDataQ, lwArr);
 
   float sumLw = 0.0f;
   for (int i = 0; i < nqps; i++) sumLw += lwArr[i];
@@ -529,7 +529,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
     const int count = split ? nqps : comm->base.nDataQps;
     for (int i = 0; i < count; i++) {
       int q = split ? i : ((activeBaseIx + i) % comm->base.nqps);
-      uint64_t v = comm->base.frmFields.qp_lat[q];
+      uint64_t v = comm->base.frmFields.send.qp_lat[q];
       if (v == 0) continue;
       if (v < minLat) minLat = v;
       if (v > maxLat) maxLat = v;
@@ -677,7 +677,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       if (dbgLatEnabled) {
         const float postLw = split ? lwArr[logicalQpIndex] : lwArr[i];
         comm->cim->lw[logicalQpIndex] = postLw;
-        comm->cim->latency[logicalQpIndex] = comm->base.frmFields.qp_lat[logicalQpIndex];
+        comm->cim->latency[logicalQpIndex] = comm->base.frmFields.send.qp_lat[logicalQpIndex];
         comm->cim->raw_latency[logicalQpIndex] = comm->base.frmCold.qp_raw_lat[logicalQpIndex];
         comm->cim->lat_bytes[logicalQpIndex] = comm->base.frmCold.qp_lat_bytes[logicalQpIndex];
       }
@@ -690,7 +690,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       const float postLw = split ? lwArr[logicalQpIndex] : lwArr[i];
       printf("FRM post: qp=%d phys=%d request=%d send=%zu lw=%.6f lat=%lu raw_lat=%lu\n",
              logicalQpIndex, physicalQpIndex, 0, (size_t)sendSzRow[0], postLw,
-             comm->base.frmFields.qp_lat[logicalQpIndex], comm->base.frmCold.qp_raw_lat[logicalQpIndex]);
+             comm->base.frmFields.send.qp_lat[logicalQpIndex], comm->base.frmCold.qp_raw_lat[logicalQpIndex]);
       fflush(stdout);
 #endif
     }
@@ -813,7 +813,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       if (dbgLatEnabled) {
         const float postLw = split ? lwArr[logicalQpIndex] : lwArr[i];
         comm->cim->lw[logicalQpIndex] = postLw;
-        comm->cim->latency[logicalQpIndex] = comm->base.frmFields.qp_lat[logicalQpIndex];
+        comm->cim->latency[logicalQpIndex] = comm->base.frmFields.send.qp_lat[logicalQpIndex];
         comm->cim->raw_latency[logicalQpIndex] = comm->base.frmCold.qp_raw_lat[logicalQpIndex];
         comm->cim->lat_bytes[logicalQpIndex] = comm->base.frmCold.qp_lat_bytes[logicalQpIndex];
       }
@@ -943,7 +943,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       if (dbgLatEnabled) {
         const float postLw = split ? lwArr[logicalQpIndex] : lwArr[i];
         comm->cim->lw[logicalQpIndex] = postLw;
-        comm->cim->latency[logicalQpIndex] = comm->base.frmFields.qp_lat[logicalQpIndex];
+        comm->cim->latency[logicalQpIndex] = comm->base.frmFields.send.qp_lat[logicalQpIndex];
         comm->cim->raw_latency[logicalQpIndex] = comm->base.frmCold.qp_raw_lat[logicalQpIndex];
         comm->cim->lat_bytes[logicalQpIndex] = comm->base.frmCold.qp_lat_bytes[logicalQpIndex];
       }
@@ -983,7 +983,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       const float postLw = split ? lwArr[logicalQpIndex] : lwArr[requestOrderByPost[p]];
       printf("FRM post: qp=%d phys=%d request=%d send=%zu lw=%.6f lat=%lu raw_lat=%lu\n",
              logicalQpIndex, physicalQpIndex, r, (size_t)sendSzRow[r], postLw,
-             comm->base.frmFields.qp_lat[logicalQpIndex], comm->base.frmCold.qp_raw_lat[logicalQpIndex]);
+             comm->base.frmFields.send.qp_lat[logicalQpIndex], comm->base.frmCold.qp_raw_lat[logicalQpIndex]);
       fflush(stdout);
     }
 #endif
@@ -1556,7 +1556,7 @@ static inline void ibFrmUpdateLatencyStamp(struct ncclIbRequest* req, struct ibv
   if (req == NULL || req->base == NULL || wc == NULL) return;
   if (wc->opcode != IBV_WC_RDMA_WRITE) return;
 
-  int qpIndex = qpMapFind(&req->base->frmFields.qpHash, wc->qp_num);
+  int qpIndex = qpMapFind(&req->base->frmFields.completion.qpHash, wc->qp_num);
   if ((unsigned)qpIndex >= (unsigned)req->base->nqps) return;
 
   static const uint8_t kZeroStampHoldoff = []() -> uint8_t {
@@ -1571,14 +1571,14 @@ static inline void ibFrmUpdateLatencyStamp(struct ncclIbRequest* req, struct ibv
   // Apply the same zero-byte holdoff to all FRM completion stamps so the
   // single-request send fast path does not bypass congestion responsiveness.
   if (bytes == 0 && kZeroStampHoldoff != 0) {
-    uint8_t skip = req->base->frmFields.qp_zero_stamp_holdoff[qpIndex];
+    uint8_t skip = req->base->frmFields.completion.qp_zero_stamp_holdoff[qpIndex];
     if (skip < kZeroStampHoldoff) {
-      req->base->frmFields.qp_zero_stamp_holdoff[qpIndex] = (uint8_t)(skip + 1);
+      req->base->frmFields.completion.qp_zero_stamp_holdoff[qpIndex] = (uint8_t)(skip + 1);
       return;
     }
-    req->base->frmFields.qp_zero_stamp_holdoff[qpIndex] = 0;
+    req->base->frmFields.completion.qp_zero_stamp_holdoff[qpIndex] = 0;
   } else {
-    req->base->frmFields.qp_zero_stamp_holdoff[qpIndex] = 0;
+    req->base->frmFields.completion.qp_zero_stamp_holdoff[qpIndex] = 0;
   }
 
   uint64_t t1 = timer_get_cycles();
@@ -1589,7 +1589,7 @@ static inline void ibFrmUpdateLatencyStamp(struct ncclIbRequest* req, struct ibv
   if (captureRawLat) {
     req->base->frmCold.qp_raw_lat[qpIndex] = us;
   }
-  req->base->frmFields.qp_lat[qpIndex] = norm_lat_us_per_mtu(us, bytes);
+  req->base->frmFields.send.qp_lat[qpIndex] = norm_lat_us_per_mtu(us, bytes);
   req->base->frmCold.qp_lat_bytes[qpIndex] = bytes;
 }
 

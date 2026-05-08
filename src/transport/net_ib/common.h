@@ -372,13 +372,30 @@ static inline int qpMapFind(const ncclIbQpNumHash* m, uint32_t qp_num);
 // Forward declaration
 struct ncclIbResiliency;
 
-struct alignas(64) ncclIbNetCommFrmFields {
-  uint64_t qp_lat[NCCL_IB_MAX_QPS];
+// Completion-side FRM state touched while resolving CQEs back to a QP and
+// applying zero-byte stamp holdoff.
+struct alignas(64) ibFrmCompletionHotFields {
   ncclIbQpNumHash qpHash;
   uint8_t qp_zero_stamp_holdoff[NCCL_IB_MAX_QPS];
 };
+static_assert(alignof(struct ibFrmCompletionHotFields) == 64, "ibFrmCompletionHotFields must be 64-byte aligned");
+static_assert((sizeof(struct ibFrmCompletionHotFields) % 64) == 0, "ibFrmCompletionHotFields size must be 64-byte multiple");
+
+// Send-side FRM state consumed when the planner reads per-QP latency.
+struct alignas(64) ibFrmSendHotFields {
+  uint64_t qp_lat[NCCL_IB_MAX_QPS];
+};
+static_assert(alignof(struct ibFrmSendHotFields) == 64, "ibFrmSendHotFields must be 64-byte aligned");
+static_assert((sizeof(struct ibFrmSendHotFields) % 64) == 0, "ibFrmSendHotFields size must be 64-byte multiple");
+
+struct alignas(64) ncclIbNetCommFrmFields {
+  struct ibFrmCompletionHotFields completion;
+  struct ibFrmSendHotFields send;
+};
 static_assert(alignof(struct ncclIbNetCommFrmFields) == 64, "ncclIbNetCommFrmFields must be 64-byte aligned");
 static_assert((sizeof(struct ncclIbNetCommFrmFields) % 64) == 0, "ncclIbNetCommFrmFields size must be 64-byte multiple");
+static_assert(offsetof(struct ncclIbNetCommFrmFields, completion) == 0, "ncclIbNetCommFrmFields::completion offset changed");
+static_assert(offsetof(struct ncclIbNetCommFrmFields, send) == sizeof(struct ibFrmCompletionHotFields), "ncclIbNetCommFrmFields::send offset changed");
 
 struct alignas(64) ibFrmColdFields {
   // Raw latency and byte-count telemetry are updated on the completion/debug
@@ -466,7 +483,7 @@ static inline ncclResult_t ncclIbCommBaseGetQpForRequest(struct ncclIbNetCommBas
 static inline ncclResult_t ncclIbCommBaseGetQpByQpNum(struct ncclIbNetCommBase* commBase, int devIndex, uint32_t qpNum, ncclIbQp** qp, int* qpIndex) {
   assert(devIndex >= 0 && devIndex < commBase->vProps.ndevs);
   assert(qp != NULL);
-  int hashedQpIndex = qpMapFind(&commBase->frmFields.qpHash, qpNum);
+  int hashedQpIndex = qpMapFind(&commBase->frmFields.completion.qpHash, qpNum);
   if ((unsigned)hashedQpIndex < (unsigned)commBase->nqps) {
     ncclIbQp* hashedQp = &commBase->qps[hashedQpIndex];
     if (hashedQp->qp != NULL && hashedQp->devIndex == devIndex && hashedQp->qp->qp_num == qpNum) {
@@ -783,7 +800,7 @@ static inline int qpMapFind(const ncclIbQpNumHash* m, uint32_t qp_num) {
 
 static inline void qpMapBuild(ncclIbNetCommBase* base) {
   if (base == NULL) return;
-  qpMapClear(&base->frmFields.qpHash);
+  qpMapClear(&base->frmFields.completion.qpHash);
 #if FRM_DEBUG
   fprintf(stdout,"Building qmap\n");
   fflush(stdout);
@@ -791,7 +808,7 @@ static inline void qpMapBuild(ncclIbNetCommBase* base) {
   for (int i = 0; i < base->nqps; i++) {
     if (base->qps[i].qp == NULL) continue;
     uint32_t qp_num = base->qps[i].qp->qp_num;
-    qpMapInsert(&base->frmFields.qpHash, qp_num, (uint16_t)i);
+    qpMapInsert(&base->frmFields.completion.qpHash, qp_num, (uint16_t)i);
   }
 }
 
