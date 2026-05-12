@@ -11,6 +11,17 @@ set(NET_IB_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/gin.cc
 )
 
+if(OCCL_NET_IB_ENABLE_TESTS OR OCCL_NET_IB_ENABLE_SINGLE_NODE_TESTS)
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third-party/googletest/CMakeLists.txt")
+        message(FATAL_ERROR "Net-IB tests require third-party/googletest. Run: git submodule update --init third-party/googletest")
+    endif()
+    include(CTest)
+    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${CMAKE_SOURCE_DIR}/third-party/googletest ${CMAKE_BINARY_DIR}/third-party/googletest EXCLUDE_FROM_ALL)
+    add_subdirectory(test)
+endif()
+
 add_subdirectory(gdaki)
 
 # Add transport sources to parent scope

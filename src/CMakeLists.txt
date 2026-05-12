@@ -302,10 +302,7 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
   endif()
   message(STATUS "occl-net-ib-plugin C++ runtime linkage: ${occl_plugin_cxx_runtime_linkage}")
 
-  set(IB_TRANSPORT_PLUGIN_SOURCES
-      ${CMAKE_CURRENT_SOURCE_DIR}/plugin/net/net_ib_plugin_v11.cc
-      ${CMAKE_CURRENT_SOURCE_DIR}/plugin/net/net_ib_plugin_stubs.cc
-      ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/cim.cc
+  set(IB_TRANSPORT_PLUGIN_NET_IB_SOURCES
       ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/common.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/connect.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/gdr.cc
@@ -313,6 +310,13 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
       ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/p2p.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/p2p_resiliency.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/reg.cc
+  )
+
+  set(IB_TRANSPORT_PLUGIN_SOURCES
+      ${CMAKE_CURRENT_SOURCE_DIR}/plugin/net/net_ib_plugin_v11.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/plugin/net/net_ib_plugin_stubs.cc
+      ${CMAKE_CURRENT_SOURCE_DIR}/transport/net_ib/cim.cc
+      ${IB_TRANSPORT_PLUGIN_NET_IB_SOURCES}
       ${CMAKE_CURRENT_SOURCE_DIR}/misc/socket.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/misc/ibvwrap.cc
       ${CMAKE_CURRENT_SOURCE_DIR}/misc/ibvsymbols.cc
@@ -353,6 +357,15 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
     "-Wl,--no-undefined"
     ${occl_plugin_cxx_runtime_link_options}
   )
+
+  if(OCCL_NET_IB_ENABLE_COVERAGE)
+    foreach(ib_transport_plugin_net_ib_source IN LISTS IB_TRANSPORT_PLUGIN_NET_IB_SOURCES)
+      set_source_files_properties(${ib_transport_plugin_net_ib_source} PROPERTIES
+        COMPILE_OPTIONS "-O0;-g;--coverage"
+      )
+    endforeach()
+    target_link_options(occl-net-ib-plugin PRIVATE --coverage)
+  endif()
 
   add_dependencies(occl-net-ib-plugin nccl_header generate_git_version)
 

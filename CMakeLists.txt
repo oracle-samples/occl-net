@@ -54,6 +54,19 @@ option(MLX5DV "Enable MLX5DV" OFF)
 option(MAX_EXT_NET_PLUGINS "Maximum external network plugins" 0)
 option(EMIT_LLVM_IR "Generate LLVM IR for device APIs" OFF)
 option(BUILD_NCCL4PY "Enable nccl4py Python bindings targets" OFF)
+option(BUILD_NCCL_EP "Build NCCL EP contrib library" OFF)
+option(OCCL_NET_IB_ENABLE_TESTS "Build OCCL Net IB GoogleTest targets" OFF)
+option(OCCL_NET_IB_ENABLE_SINGLE_NODE_TESTS "Build OCCL Net IB GPU-local single-node GoogleTest targets" OFF)
+option(OCCL_NET_IB_ENABLE_COVERAGE "Build OCCL Net IB targets with gcov/lcov coverage instrumentation" OFF)
+
+if(OCCL_NET_IB_ENABLE_COVERAGE)
+    set(OCCL_NET_IB_ENABLE_TESTS ON CACHE BOOL "Build OCCL Net IB GoogleTest targets" FORCE)
+    set(OCCL_NET_IB_ENABLE_SINGLE_NODE_TESTS ON CACHE BOOL "Build OCCL Net IB GPU-local single-node GoogleTest targets" FORCE)
+endif()
+
+if(OCCL_NET_IB_ENABLE_TESTS OR OCCL_NET_IB_ENABLE_SINGLE_NODE_TESTS)
+    enable_testing()
+endif()
 
 # Detect OS
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
@@ -75,6 +88,10 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "C
     add_definitions(-DNCCL_COMPILER_GCC)
 else()
     message(FATAL_ERROR "Unsupported compiler: ${CMAKE_CXX_COMPILER_ID}")
+endif()
+
+if(OCCL_NET_IB_ENABLE_COVERAGE AND NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang"))
+    message(FATAL_ERROR "OCCL_NET_IB_ENABLE_COVERAGE requires GCC or Clang")
 endif()
 
 # Reconfigure safely when the build directory was first generated in a
@@ -264,6 +281,15 @@ add_subdirectory(plugins/profiler/example)
 add_subdirectory(plugins/tuner/example)
 add_subdirectory(plugins/env/example)
 add_subdirectory(src)
+
+if(OCCL_NET_IB_ENABLE_COVERAGE)
+  add_custom_target(net_ib_coverage
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/run_net_ib_tests.sh --coverage ${CMAKE_BINARY_DIR}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Generating net-IB coverage report"
+    USES_TERMINAL
+  )
+endif()
 
 # Add package building subdirectories
 if(BUILD_DEBIAN_PACKAGE OR BUILD_PACKAGES)

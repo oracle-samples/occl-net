@@ -21,6 +21,7 @@ RUN dnf install -y oracle-epel-release-el9 \
     clang-tools-extra \
     cppcheck \
     ShellCheck \
+    lcov \
     git \
     rsync \
     openssh-clients \
@@ -31,8 +32,9 @@ RUN dnf install -y oracle-epel-release-el9 \
     python3-pip \
     && dnf clean all
 
-# Upgrade CMake via pip to ensure version >= 3.24 for multi-arch compatibility
-RUN pip3 install cmake --upgrade
+# Upgrade CMake via pip to ensure version >= 3.24 for multi-arch compatibility.
+# Install gcovr for optional coverage consumers; LCOV remains the canonical summary.
+RUN pip3 install cmake gcovr --upgrade
 
 # Inject OpenMPI paths directly to support Enterprise Linux environment modules
 # Includes both x86_64 (lib64) and aarch64 (lib) paths
