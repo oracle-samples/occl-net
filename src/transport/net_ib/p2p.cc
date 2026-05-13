@@ -68,21 +68,12 @@ static inline void ibFrmFlushTelemetry(struct ncclIbSendComm* comm) {
 }
 
 static inline bool ibFrmGateUpdate(struct ncclIbSendComm* comm) {
-  bool enabled = g_ncclIbUseCim &&
-      comm != NULL &&
-      comm->base.nqps > 0 &&
-      comm->cim != NULL &&
-      comm->multiSendScratch.storage != NULL &&
-      ibFrmResiliencyHealthy(&comm->base);
-
-  if (comm != NULL) {
-    if (!enabled && comm->frmGateOpen) {
-      ibFrmFlushTelemetry(comm);
-    } else if (enabled && !comm->frmGateOpen) {
-      qpMapBuild(&comm->base);
-    }
-    comm->frmGateOpen = enabled;
+  bool enabled = __builtin_expect(comm->cim != NULL, 1) &&
+      __builtin_expect(ibFrmResiliencyHealthy(&comm->base), 1);
+  if (__builtin_expect(!enabled && comm->frmGateOpen, 0)) {
+    ibFrmFlushTelemetry(comm);
   }
+  comm->frmGateOpen = enabled;
   return enabled;
 }
 
@@ -1592,8 +1583,7 @@ static inline void ibFrmUpdateLatencyStamp(struct ncclIbRequest* req, struct ibv
   uint64_t t1 = timer_get_cycles();
   if (t0 == 0 || t1 <= t0) return;
 
-  const double inv = (g_inv_cyc_per_us > 0.0) ? g_inv_cyc_per_us : 0.0;
-  uint64_t us = (inv > 0.0) ? (uint64_t)((double)(t1 - t0) * inv) : 0;
+  uint64_t us = (uint64_t)((double)(t1 - t0) * g_inv_cyc_per_us);
   if (captureRawLat) {
     req->base->frmCold.qp_raw_lat[qpIndex] = us;
   }

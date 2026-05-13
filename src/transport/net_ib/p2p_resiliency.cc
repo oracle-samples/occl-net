@@ -1681,6 +1681,9 @@ ncclResult_t ncclIbResiliencyProgress(struct ncclIbResiliency* resCtx) {
   }
   if (resCtx->outstandingRequests == 0 && !ncclIbResiliencyHasPendingQpRecovery(resCtx)) {
     INFO(NCCL_NET, "NET/IB: %s: All resiliency operations are completed for resiliency context (%s comm=%p). Marking progress as completed.", __func__, resCtx->baseComm->isSend ? "send" : "recv", resCtx->baseComm);
+    // Rejoined send-side QPs can carry new qp_num values, so rebuild the
+    // completion hash once here instead of paying that work in the hot FRM gate.
+    qpMapBuild(resCtx->baseComm);
     resCtx->inProgress = false;
   }
   return ncclSuccess;
