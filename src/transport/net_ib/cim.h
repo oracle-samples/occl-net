@@ -26,6 +26,8 @@ struct CIMState {
     uint32_t lat_bytes[CIM_MAX_QPS]; // Bytes used for the most recent published stamp
     unsigned int seed; // RNG seed per thread
     int lw_initialized;   // 0 = not initialized, 1 = initialized
+    uint8_t split0_mild_score[CIM_MAX_QPS];   // split=0 repeated weak-spread score per active window base
+    uint8_t split0_mild_slow_qp[CIM_MAX_QPS]; // split=0 last repeated slower global QP per active window base
 };
 
 /**

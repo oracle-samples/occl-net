@@ -26,6 +26,10 @@ NCCL_PARAM(FrmZeroStampHoldoff, "FRM_ZERO_STAMP_HOLDOFF", 2);
 #define FRM_LAT_NORM_HALF_MTU_BYTES 2048u
 
 static constexpr int kIbMultiSendAlign = 128;
+static constexpr uint64_t kIbFrmSplit0MildEpsUs = 1ULL;
+static constexpr uint8_t kIbFrmSplit0MildScoreHot = 3u;
+static constexpr uint8_t kIbFrmSplit0MildSlowInvalid = 0xffu;
+static constexpr float kIbFrmSplit0MildSlowLaneFrac = 0.80f;
 
 static inline bool ibFrmResiliencyHealthy(const struct ncclIbNetCommBase* base) {
   if (base == NULL || base->resiliency == NULL) return true;
@@ -56,6 +60,8 @@ static inline void ibFrmFlushTelemetry(struct ncclIbSendComm* comm) {
     memset(comm->cim->latency, 0, sizeof(comm->cim->latency));
     memset(comm->cim->raw_latency, 0, sizeof(comm->cim->raw_latency));
     memset(comm->cim->lat_bytes, 0, sizeof(comm->cim->lat_bytes));
+    memset(comm->cim->split0_mild_score, 0, sizeof(comm->cim->split0_mild_score));
+    memset(comm->cim->split0_mild_slow_qp, kIbFrmSplit0MildSlowInvalid, sizeof(comm->cim->split0_mild_slow_qp));
     comm->cim->dbg_view_count = (uint32_t)comm->cim->nqps;
     for (int i = 0; i < comm->cim->nqps; i++) {
       comm->cim->dbg_view_qp_index[i] = (uint32_t)i;
@@ -118,6 +124,119 @@ static inline void ibFrmComputeLw(struct ncclIbSendComm* comm, int nqps, float* 
       lwArr[i] *= inv;
     }
   }
+}
+
+enum ibFrmSplit0Decision {
+  IB_FRM_SPLIT0_EQUAL = 0,
+  IB_FRM_SPLIT0_MILD = 1,
+  IB_FRM_SPLIT0_FULL = 2,
+};
+
+static inline void ibFrmSplit0DecayMildState(CIMState* cim, int windowBase) {
+  if (cim == NULL) return;
+  if ((unsigned)windowBase >= (unsigned)cim->nqps) return;
+
+  uint8_t score = cim->split0_mild_score[windowBase];
+  if (score == 0) {
+    cim->split0_mild_slow_qp[windowBase] = kIbFrmSplit0MildSlowInvalid;
+    return;
+  }
+
+  score--;
+  cim->split0_mild_score[windowBase] = score;
+  if (score == 0) {
+    cim->split0_mild_slow_qp[windowBase] = kIbFrmSplit0MildSlowInvalid;
+  }
+}
+
+static inline void ibFrmSplit0ApplyMildWeights(struct ncclIbSendComm* comm,
+                                               int activeBaseIx,
+                                               int nDataQps,
+                                               int slowQp,
+                                               float* lwArr) {
+  if (lwArr == NULL || nDataQps <= 0) return;
+
+  const float eq = 1.0f / (float)nDataQps;
+  if (nDataQps == 1 || slowQp < 0) {
+    lwArr[0] = 1.0f;
+    return;
+  }
+
+  const float slowWeight = eq * kIbFrmSplit0MildSlowLaneFrac;
+  const float fastWeight = (1.0f - slowWeight) / (float)(nDataQps - 1);
+  int q = activeBaseIx % comm->base.nqps;
+  for (int i = 0; i < nDataQps; i++) {
+    lwArr[i] = (q == slowQp) ? slowWeight : fastWeight;
+    if (++q == comm->base.nqps) q = 0;
+  }
+}
+
+// Split=0 needs a softer wake-up path than the binary full-FRM threshold:
+// repeated weak spread on the same active window gets a gentle bias around
+// equal split, while strong spread still takes the normal full FRM planner.
+static inline ibFrmSplit0Decision ibFrmSelectSplit0Decision(struct ncclIbSendComm* comm,
+                                                            int activeBaseIx,
+                                                            float* lwArr) {
+  if (comm == NULL || comm->cim == NULL || lwArr == NULL) return IB_FRM_SPLIT0_EQUAL;
+
+  const int totalQps = comm->base.nqps;
+  if (totalQps <= 0) return IB_FRM_SPLIT0_EQUAL;
+
+  int nDataQps = comm->base.nDataQps;
+  if (nDataQps <= 1) return IB_FRM_SPLIT0_EQUAL;
+  if (nDataQps > totalQps) nDataQps = totalQps;
+
+  const int windowBase = activeBaseIx % totalQps;
+  const uint64_t spreadEpsUs = comm->cim->spread_eps_us;
+  uint64_t minLat = UINT64_MAX;
+  uint64_t maxLat = 0;
+  int slowQp = -1;
+  int validCount = 0;
+  int q = windowBase;
+
+  for (int i = 0; i < nDataQps; i++) {
+    const uint64_t lat = comm->base.frmFields.send.qp_lat[q];
+    if (lat != 0) {
+      validCount++;
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) {
+        maxLat = lat;
+        slowQp = q;
+      }
+    }
+    if (++q == totalQps) q = 0;
+  }
+
+  if (validCount != nDataQps || minLat == UINT64_MAX || slowQp < 0 || maxLat <= minLat) {
+    ibFrmSplit0DecayMildState(comm->cim, windowBase);
+    return IB_FRM_SPLIT0_EQUAL;
+  }
+
+  const uint64_t spread = maxLat - minLat;
+  if (spread > spreadEpsUs) {
+    comm->cim->split0_mild_score[windowBase] = 0;
+    comm->cim->split0_mild_slow_qp[windowBase] = kIbFrmSplit0MildSlowInvalid;
+    return IB_FRM_SPLIT0_FULL;
+  }
+
+  if (spread <= kIbFrmSplit0MildEpsUs || spreadEpsUs <= kIbFrmSplit0MildEpsUs) {
+    ibFrmSplit0DecayMildState(comm->cim, windowBase);
+    return IB_FRM_SPLIT0_EQUAL;
+  }
+
+  const uint8_t slowQp8 = (uint8_t)slowQp;
+  uint8_t score = comm->cim->split0_mild_score[windowBase];
+  if (score != 0 && comm->cim->split0_mild_slow_qp[windowBase] == slowQp8) {
+    if (score < UINT8_MAX) score++;
+  } else {
+    score = 1;
+    comm->cim->split0_mild_slow_qp[windowBase] = slowQp8;
+  }
+  comm->cim->split0_mild_score[windowBase] = score;
+  if (score < kIbFrmSplit0MildScoreHot) return IB_FRM_SPLIT0_EQUAL;
+
+  ibFrmSplit0ApplyMildWeights(comm, windowBase, nDataQps, slowQp, lwArr);
+  return IB_FRM_SPLIT0_MILD;
 }
 
 static_assert((QP_SIG_RING & (QP_SIG_RING - 1)) == 0, "QP_SIG_RING must be a power of two");
@@ -513,14 +632,13 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
 
   float* lwArr = scratch->lwPerQp;
   bool bypassEqual = false;
-  {
+  bool useSplit0Mild = false;
+  if (split) {
     const uint64_t spreadEpsUs = comm->cim->spread_eps_us;
     uint64_t minLat = UINT64_MAX;
     uint64_t maxLat = 0;
-    const int count = split ? nqps : comm->base.nDataQps;
-    for (int i = 0; i < count; i++) {
-      int q = split ? i : ((activeBaseIx + i) % comm->base.nqps);
-      uint64_t v = comm->base.frmFields.send.qp_lat[q];
+    for (int i = 0; i < nqps; i++) {
+      uint64_t v = comm->base.frmFields.send.qp_lat[i];
       if (v == 0) continue;
       if (v < minLat) minLat = v;
       if (v > maxLat) maxLat = v;
@@ -528,11 +646,17 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
     if (minLat == UINT64_MAX || (maxLat - minLat) <= spreadEpsUs) {
       bypassEqual = true;
     }
+  } else {
+    ibFrmSplit0Decision split0Decision = ibFrmSelectSplit0Decision(comm, activeBaseIx, lwArr);
+    bypassEqual = split0Decision == IB_FRM_SPLIT0_EQUAL;
+    useSplit0Mild = split0Decision == IB_FRM_SPLIT0_MILD;
   }
   const bool useFrmNow = !bypassEqual;
 
   if (useFrmNow) {
-    ibFrmComputeLw(comm, nqps, lwArr, split, activeBaseIx);
+    if (!useSplit0Mild) {
+      ibFrmComputeLw(comm, nqps, lwArr, split, activeBaseIx);
+    }
   } else {
     const float eq = 1.0f / (float)nqps;
     for (int q = 0; q < nqps; q++) lwArr[q] = eq;
