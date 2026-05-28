@@ -23,15 +23,29 @@ NCCL_PARAM(IbTc, "IB_TC", -1);
 NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", -1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
 
+static inline uint64_t ibFrmSplit0ResiliencySpreadEpsUs() {
+  static const uint64_t split0ResiliencySpreadEpsUs = []() -> uint64_t {
+    constexpr int64_t uninitialized = INT64_MIN;
+    static int8_t noCache = -1;
+    static int64_t cache = uninitialized;
+    const int64_t value =
+        ncclLoadParam("OCCL_FRM_SPLIT0_RESILIENCY_SPREAD_EPS_US", 7, uninitialized, &cache, &noCache);
+
+    if (value < 0) return 7ULL;
+    return (uint64_t)value;
+  }();
+  return split0ResiliencySpreadEpsUs;
+}
+
 static inline uint64_t ibFrmResolveSpreadEpsUs(const struct ncclIbSendComm* comm) {
   const int64_t value = ncclParamFrmSpreadEpsUs();
   uint64_t eps = value < 0 ? 2ULL : (uint64_t)value;
   if (comm == NULL) return eps;
   if (comm->base.resiliency == NULL) return eps;
   if (comm->base.splitDataOnQps != 0) return eps;
-  if (comm->base.nDataQps != 2) return eps;
+  if (comm->base.nDataQps <= 1) return eps;
   if (comm->base.nqps < 8) return eps;
-  return eps < 7ULL ? 7ULL : eps;
+  return ibFrmSplit0ResiliencySpreadEpsUs();
 }
 
 enum ncclIbCommState {
