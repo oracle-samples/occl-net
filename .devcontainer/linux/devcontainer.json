@@ -1,31 +1,44 @@
+// Copyright (c) 2026 OCCL-net.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 {
-    "name": "OCCL Net Plugin - Oracle Linux 9 (x86_64)",
+    "name": "OCCL Net Plugin - Linux Release (x86_64)",
     "build": {
-        // Use common OL9 Dockerfile; this variant targets x86_64.
-        "dockerfile": "../Dockerfile.ol9",
+        "dockerfile": "../Dockerfile.linux",
+        "target": "vscode-dev",
         "options": [
-            // Build for x86_64 even on multi-arch hosts.
             "--platform=linux/amd64",
-            // Always pull latest base image.
             "--pull=true"
         ],
         "args": {
-            // Arch-specific cache/toolchain selector.
-            "TARGET_ARCH_CACHE": "amd64"
+            "TARGET_ARCH_CACHE": "linux-amd64"
+        }
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+            "version": "latest"
         }
     },
     "mounts": [
-        // Shared compiler cache across container rebuilds.
         "source=occl-net-ccache-vol,target=/root/.cache/ccache,type=volume",
-        // Reuse host SSH keys (read-only) for repo access.
         "source=${localEnv:HOME}/.ssh,target=/root/.ssh,type=bind,readonly"
     ],
-    // Avoid git “dubious ownership” warnings in mapped workspaces.
+    "containerEnv": {
+        "OCCL_NET_HOST_WORKSPACE": "${localWorkspaceFolder}",
+        "OCCL_NET_RELEASE_BUILDER_IMAGE": "occl-net-linux-release-builder:latest"
+    },
     "postCreateCommand": "git config --global --add safe.directory '*'",
     "customizations": {
         "vscode": {
             "extensions": [
-                // Core C/C++ and tooling extensions for this repo.
                 "llvm-vs-code-extensions.vscode-clangd",
                 "ms-vscode.cpptools",
                 "ms-vscode.cmake-tools",
@@ -34,31 +47,28 @@
                 "${containerWorkspaceFolder}/.vscode/extensions/octo-0.0.25.vsix"
             ],
             "settings": {
-                // Prefer clangd over MS C/C++ IntelliSense.
                 "C_Cpp.intelliSenseEngine": "disabled",
                 "clangd.arguments": [
                     "--background-index",
-                    "--compile-commands-dir=${workspaceFolder}/build",
+                    "--compile-commands-dir=${workspaceFolder}/build/linux-release",
                     "--clang-tidy",
                     "--header-insertion=iwyu",
                     "--completion-style=detailed"
                 ],
                 "editor.formatOnSave": true,
                 "[c]": {
-                    // Use clangd as formatter for C files.
                     "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
                 },
-                // Use Ninja for faster CMake builds.
                 "cmake.generator": "Ninja",
-                "cmake.configureOnOpen": true,
+                "cmake.configureOnOpen": false,
+                "cmake.buildDirectory": "${workspaceFolder}/build/linux-release",
                 "cmake.configureArgs": [
-                    // Use ccache to speed up (re)builds.
+                    "-C${workspaceFolder}/cmake/occl-net-ib-release-cache.cmake",
                     "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
                     "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
                 ]
             }
         }
     },
-    // Run as root to simplify package installation.
     "remoteUser": "root"
 }

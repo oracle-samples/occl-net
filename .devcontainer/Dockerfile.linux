@@ -1,0 +1,159 @@
+# Copyright (c) 2026 OCCL-net.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Invalidate cache to prevent architecture-specific layer collisions.
+ARG TARGET_ARCH_CACHE
+
+# CUDA 12.4 is the newest CUDA line qualified for a CentOS 7 / glibc 2.17
+# builder. Artifacts built here keep an OL7-compatible libc floor and are
+# validated separately on CUDA 13-class runtime hosts.
+FROM nvidia/cuda:12.4.0-devel-centos7 AS release-builder
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG CMAKE_VERSION=3.27.9
+ARG DEVTOOLSET_VERSION=11
+
+ENV DEVTOOLSET_ROOT="/opt/rh/devtoolset-${DEVTOOLSET_VERSION}/root"
+ENV PATH="${DEVTOOLSET_ROOT}/usr/bin:/usr/local/bin:/usr/lib64/openmpi/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${DEVTOOLSET_ROOT}/usr/lib64:/usr/lib64/openmpi/lib:${LD_LIBRARY_PATH}"
+ENV CC="${DEVTOOLSET_ROOT}/usr/bin/gcc"
+ENV CXX="${DEVTOOLSET_ROOT}/usr/bin/g++"
+ENV CUDAHOSTCXX="${DEVTOOLSET_ROOT}/usr/bin/g++"
+ENV MPI_HOME="/usr/lib64/openmpi"
+
+# CentOS 7 is EOL. Pin the repos to archive/vault URLs so the release
+# devcontainer is reproducible even after mirrorlist metadata expires.
+RUN set -eux; \
+    printf '%s\n' \
+      '[base]' \
+      'name=CentOS-7 - Base' \
+      'baseurl=http://vault.centos.org/7.9.2009/os/$basearch/' \
+      'enabled=1' \
+      'gpgcheck=0' \
+      '' \
+      '[updates]' \
+      'name=CentOS-7 - Updates' \
+      'baseurl=http://vault.centos.org/7.9.2009/updates/$basearch/' \
+      'enabled=1' \
+      'gpgcheck=0' \
+      '' \
+      '[extras]' \
+      'name=CentOS-7 - Extras' \
+      'baseurl=http://vault.centos.org/7.9.2009/extras/$basearch/' \
+      'enabled=1' \
+      'gpgcheck=0' \
+      > /etc/yum.repos.d/CentOS-Base.repo; \
+    for repo_file in /etc/yum.repos.d/CentOS-*.repo; do \
+      if [[ "${repo_file}" != "/etc/yum.repos.d/CentOS-Base.repo" ]]; then \
+        mv "${repo_file}" "${repo_file}.disabled"; \
+      fi; \
+    done; \
+    yum clean all; \
+    yum makecache fast; \
+    yum install -y epel-release centos-release-scl ca-certificates; \
+    update-ca-trust; \
+    printf '%s\n' \
+      '[centos-sclo-sclo]' \
+      'name=CentOS-7 - SCLo sclo' \
+      'baseurl=http://vault.centos.org/7.9.2009/sclo/$basearch/sclo/' \
+      'enabled=1' \
+      'gpgcheck=0' \
+      > /etc/yum.repos.d/CentOS-SCLo-scl.repo; \
+    printf '%s\n' \
+      '[centos-sclo-rh]' \
+      'name=CentOS-7 - SCLo rh' \
+      'baseurl=http://vault.centos.org/7.9.2009/sclo/$basearch/rh/' \
+      'enabled=1' \
+      'gpgcheck=0' \
+      > /etc/yum.repos.d/CentOS-SCLo-scl-rh.repo; \
+    printf '%s\n' \
+      '[epel]' \
+      'name=Extra Packages for Enterprise Linux 7 - $basearch' \
+      'baseurl=https://archives.fedoraproject.org/pub/archive/epel/7/$basearch' \
+      'enabled=1' \
+      'gpgcheck=0' \
+      > /etc/yum.repos.d/epel.repo; \
+    rm -f /etc/yum.repos.d/epel-testing.repo; \
+    yum clean all; \
+    yum makecache fast; \
+    yum install -y \
+      "devtoolset-${DEVTOOLSET_VERSION}-gcc" \
+      "devtoolset-${DEVTOOLSET_VERSION}-gcc-c++" \
+      "devtoolset-${DEVTOOLSET_VERSION}-binutils" \
+      "devtoolset-${DEVTOOLSET_VERSION}-libstdc++-devel" \
+      binutils \
+      bzip2 \
+      ccache \
+      curl \
+      file \
+      findutils \
+      gdb \
+      git \
+      libstdc++-static \
+      make \
+      ninja-build \
+      openmpi \
+      openmpi-devel \
+      openssh-clients \
+      patch \
+      perl \
+      pkgconfig \
+      python3 \
+      python3-pip \
+      rsync \
+      tar \
+      unzip \
+      wget \
+      which \
+      xz \
+      zlib-devel; \
+    yum clean all; \
+    rm -rf /var/cache/yum
+
+# Install a modern CMake without changing the system glibc baseline.
+RUN set -eux; \
+    curl -fsSL -o /tmp/cmake.sh \
+      "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.sh"; \
+    sh /tmp/cmake.sh --skip-license --prefix=/usr/local; \
+    rm -f /tmp/cmake.sh; \
+    cmake --version
+
+WORKDIR /workspace
+
+# VS Code Server requires newer glibc/libstdc++ than CentOS 7 provides. This
+# stage is only for interactive editor tooling; release artifacts are still
+# built by the `release-builder` stage above.
+FROM mcr.microsoft.com/devcontainers/base:ubuntu-22.04 AS vscode-dev
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN set -eux; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates \
+      ccache \
+      clangd \
+      cmake \
+      curl \
+      file \
+      git \
+      less \
+      ninja-build \
+      openssh-client \
+      pkg-config \
+      python3 \
+      rsync \
+      shellcheck \
+      wget; \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace

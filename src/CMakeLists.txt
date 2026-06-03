@@ -353,9 +353,17 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
       ${CMAKE_DL_LIBS}
       ${EXTRA_LIBS}
   )
+  set(occl_net_ib_plugin_version_script
+      "${CMAKE_CURRENT_SOURCE_DIR}/plugin/net/occl-net-ib-plugin.map"
+  )
   target_link_options(occl-net-ib-plugin PRIVATE
     "-Wl,--no-undefined"
+    "-Wl,--exclude-libs,ALL"
+    "-Wl,--version-script=${occl_net_ib_plugin_version_script}"
     ${occl_plugin_cxx_runtime_link_options}
+  )
+  set_property(TARGET occl-net-ib-plugin APPEND PROPERTY
+      LINK_DEPENDS "${occl_net_ib_plugin_version_script}"
   )
 
   if(OCCL_NET_IB_ENABLE_COVERAGE)

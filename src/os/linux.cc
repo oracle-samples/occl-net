@@ -80,12 +80,22 @@ static ncclResult_t setCpuStackSize() {
       strcpy(buf, "unlimited");
     else
       snprintf(buf, sizeof(buf), "%ldKB", stackLimit.rlim_cur / 1024);
-    INFO(NCCL_INIT | NCCL_ENV, "Stack size limit (%s) is unsafe; will use %dKB for newly launched threads",
+    INFO(NCCL_INIT | NCCL_ENV, "Stack size limit (%s) is unsafe; attempting to use %dKB for newly launched threads",
          buf, SAFE_STACK_SIZE / 1024);
 
-    // Change the default pthread stack size (via a nonportable API as the feature is not available in std::thread)
+    // Change the default pthread stack size when the glibc extension exists.
+    // OL7/glibc 2.17 does not provide this symbol, so resolve it lazily to keep
+    // the portable plugin from gaining a GLIBC_2.18 requirement.
     PTHREADCHECK(pthread_attr_setstacksize(&attr, SAFE_STACK_SIZE), "pthread_attr_setstacksize");
-    PTHREADCHECK(pthread_setattr_default_np(&attr), "pthread_setattr_default_np");
+    typedef int (*setPthreadAttrDefaultFn)(const pthread_attr_t*);
+    setPthreadAttrDefaultFn setPthreadAttrDefault =
+        reinterpret_cast<setPthreadAttrDefaultFn>(dlsym(RTLD_DEFAULT, "pthread_setattr_default_np"));
+    if (setPthreadAttrDefault != nullptr) {
+      PTHREADCHECK(setPthreadAttrDefault(&attr), "pthread_setattr_default_np");
+    } else {
+      INFO(NCCL_INIT | NCCL_ENV,
+           "pthread_setattr_default_np is unavailable; keeping the current default pthread stack size");
+    }
   }
 
   PTHREADCHECK(pthread_attr_destroy(&attr), "pthread_attr_destroy");
