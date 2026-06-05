@@ -19,7 +19,6 @@ OCCL_NET_IB_PLUGIN_1.0 {
     ncclNetPlugin_v9;
     ncclNetPlugin_v10;
     ncclNetPlugin_v11;
-    ncclNetPlugin_v12;
   local:
     *;
 };

@@ -27,16 +27,24 @@ Build from VS Code or a shell in the devcontainer:
 bash scripts/build-linux-release-plugin.sh
 ```
 
+The release plugin embeds a private ELF version section. Override the default only when intentionally publishing a new plugin artifact version:
+
+```bash
+OCCL_NET_IB_PLUGIN_VERSION=0.1.0 bash scripts/build-linux-release-plugin.sh
+```
+
 Inspect the artifact before publishing:
 
 ```bash
 bash scripts/verify-linux-release-plugin.sh build/linux-release/lib/liboccl-net-ib.so
+readelf -p .occl_net_ib_version build/linux-release/lib/liboccl-net-ib.so
 ```
 
 Release gates:
 
 - `NEEDED` must not include `libcudart`, `libstdc++`, `libibverbs`, or `libmlx5`.
 - The highest `GLIBC_*` requirement must be no newer than `GLIBC_2.17`.
-- Exported dynamic symbols must include `ncclNetPlugin_v6` through `ncclNetPlugin_v12`.
+- Exported dynamic symbols must include `ncclNetPlugin_v6` through `ncclNetPlugin_v11`, matching this branch's current net plugin ABI.
+- The private `.occl_net_ib_version` section must contain the expected plugin version, defaulting to `occl-net-ib version 0.1.0`.
 - Static C++ runtime symbols should not appear as public dynamic symbols.
 - The same artifact must load and initialize on CUDA 12.x and CUDA 13-class runtime hosts before publication.

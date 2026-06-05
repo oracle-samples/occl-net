@@ -18,6 +18,18 @@
 
 #include "env.h"
 
+#ifndef OCCL_NET_IB_PLUGIN_VERSION
+#define OCCL_NET_IB_PLUGIN_VERSION "0.1.0"
+#endif
+
+namespace {
+#if defined(__GNUC__) && !defined(_WIN32)
+__attribute__((used, section(".occl_net_ib_version")))
+#endif
+const char occlNetIbPluginVersionSection[] =
+    "occl-net-ib version " OCCL_NET_IB_PLUGIN_VERSION;
+}  // namespace
+
 // Standalone net_ib plugin build does not link the full core environment
 // initialization objects. Provide the minimal symbols required by shared
 // utility code.

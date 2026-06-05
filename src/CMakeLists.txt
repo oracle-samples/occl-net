@@ -261,6 +261,7 @@ set_target_properties(nccl_static PROPERTIES
 option(BUILD_IB_TRANSPORT_PLUGIN "Build an external net plugin from transport/net_ib implementation" ON)
 option(OCCL_PLUGIN_STATIC_CUDART "Compatibility knob for older standalone plugin builds; ignored because the standalone IB transport plugin no longer links a GPU runtime" ON)
 option(OCCL_PLUGIN_STATIC_CXX_RUNTIME "Link the standalone IB transport plugin against static libstdc++ when supported while keeping libgcc shared to avoid host libstdc++.so.6 ABI mismatches without raising the glibc baseline unnecessarily" ON)
+set(OCCL_NET_IB_PLUGIN_VERSION "0.1.0" CACHE STRING "Version string embedded in the standalone IB transport plugin")
 
 if(BUILD_IB_TRANSPORT_PLUGIN)
   include(CMakePushCheckState)
@@ -343,7 +344,10 @@ if(BUILD_IB_TRANSPORT_PLUGIN)
       ${CMAKE_BINARY_DIR}/include
       ${CMAKE_BINARY_DIR}/obj/include
   )
-  target_compile_definitions(occl-net-ib-plugin PRIVATE OCCL_DISABLE_CUDA_RUNTIME=1)
+  target_compile_definitions(occl-net-ib-plugin PRIVATE
+    OCCL_DISABLE_CUDA_RUNTIME=1
+    OCCL_NET_IB_PLUGIN_VERSION="${OCCL_NET_IB_PLUGIN_VERSION}"
+  )
 
   # Build as standalone plugin without linking nccl_static to avoid pulling
   # the full device kernel build graph.

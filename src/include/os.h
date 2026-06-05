@@ -38,6 +38,7 @@ uint64_t ncclOsGetPid();
 uint64_t ncclOsGetTid();
 size_t ncclOsGetPageSize();
 ncclResult_t ncclOsInitialize();
+ncclResult_t ncclOsSetFilesLimit();
 
 /* Aligned memory allocation */
 void* ncclOsAlignedAlloc(size_t alignment, size_t size);
@@ -46,6 +47,17 @@ void ncclOsAlignedFree(void* ptr);
 std::tm* ncclOsLocaltime(const time_t* timer, std::tm* buf);
 
 void ncclOsSetEnv(const char* name, const char* value);
+char* ncclOsRealpath(const char* path, char* resolved_path);
+
+/* Dynamic library loading */
+typedef void* ncclOsLibraryHandle;
+#define NCCL_OS_DL_LAZY 0
+#define NCCL_OS_DL_NOW  1
+ncclOsLibraryHandle ncclOsDlopen(const char* filename);
+ncclOsLibraryHandle ncclOsDlopen(const char* path, int mode);
+void* ncclOsDlsym(ncclOsLibraryHandle handle, const char* symbol);
+void ncclOsDlclose(ncclOsLibraryHandle handle);
+const char* ncclOsDlerror();
 
 /* Socket functions */
 bool ncclOsSocketIsValid(struct ncclSocket* sock);
@@ -77,5 +89,36 @@ ncclAffinity ncclOsCpuAnd(const ncclAffinity& a, const ncclAffinity& b);
 ncclResult_t ncclOsGetAffinity(ncclAffinity* affinity);
 ncclResult_t ncclOsSetAffinity(const ncclAffinity affinity);
 int ncclOsGetCpu();
+
+/* Shared memory functions */
+#ifdef NCCL_OS_LINUX
+typedef int ncclShmDescriptor;
+#elif defined(NCCL_OS_WINDOWS)
+typedef HANDLE ncclShmDescriptor;
+#else
+typedef int ncclShmDescriptor;
+#endif
+
+struct ncclShmHandleInternal {
+  ncclShmDescriptor shmDesc;
+  char* shmPath;
+  char* shmPtr;
+  void* devShmPtr;
+  size_t shmSize;
+  size_t realShmSize;
+  int* refcount;
+};
+
+void ncclOsShmHandleInit(ncclShmDescriptor shmDesc, char* shmPath, size_t shmSize, size_t realShmSize,
+                         char* hptr, void* dptr, bool create,
+                         struct ncclShmHandleInternal* handle);
+ncclResult_t ncclOsShmOpen(char* shmPath, size_t shmPathSize, size_t shmSize,
+                           void** shmPtr, void** devShmPtr, int refcount,
+                           struct ncclShmHandleInternal** handle);
+ncclResult_t ncclOsShmClose(struct ncclShmHandleInternal* handle);
+ncclResult_t ncclOsShmUnlink(struct ncclShmHandleInternal* handle);
+
+/* NVML */
+ncclResult_t ncclOsNvmlOpen(ncclOsLibraryHandle* handle);
 
 #endif

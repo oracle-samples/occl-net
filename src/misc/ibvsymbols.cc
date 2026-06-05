@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "ibvsymbols.h"
+#include "param.h"
 
 #ifdef NCCL_BUILD_RDMA_CORE
 /* RDMA-core linking mode. Symbols are pointers to linked IB Verbs */

@@ -9,7 +9,11 @@
 #define NCCL_GDRWRAP_H_
 
 #include "nccl.h"
+#ifdef OCCL_DISABLE_CUDA_RUNTIME
+#include "checks.h"
+#else
 #include "alloc.h"
+#endif
 #include <stdint.h> // for standard [u]intX_t types
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,6 +149,7 @@ ncclResult_t wrap_gdr_copy_from_mapping(gdr_mh_t handle, void *h_ptr, const void
 // Global GDR driver handle
 extern gdr_t ncclGdrCopy;
 
+#ifndef OCCL_DISABLE_CUDA_RUNTIME
 #include "alloc.h"
 
 typedef struct gdr_mem_desc {
@@ -273,5 +278,6 @@ static ncclResult_t freeMemCPUAccessible(T *ptr, void *gdrHandle, struct ncclMem
   }
   return ncclSuccess;
 }
+#endif // OCCL_DISABLE_CUDA_RUNTIME
 
 #endif // End include guard
