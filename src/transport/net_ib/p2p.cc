@@ -614,9 +614,8 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
     return ibMultiSendBaseline(comm, slot);
   }
 
-  const char* traceMode = trackResiliency ? "FRM+resiliency" : "FRM";
   TRACE(NCCL_NET, "NET/IB: %s: Posting %s send request (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d)",
-        __func__, traceMode, reqs[0], reqs[0]->base, reqs[0]->id, slot, nreqs);
+        __func__, trackResiliency ? "FRM+resiliency" : "FRM", reqs[0], reqs[0]->base, reqs[0]->id, slot, nreqs);
 
   const int nqps = ncclIbCommBaseGetNqpsPerRequest(&comm->base);
   const bool split = comm->base.splitDataOnQps == 1;
@@ -712,7 +711,9 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       int logicalQpIndex = -1;
       ncclIbQp* qp = NULL;
       NCCLCHECK(ncclIbCommBaseGetQpForRequest(&comm->base, req->id, i, &qp, &logicalQpIndex));
+#if FRM_DEBUG
       const int physicalQpIndex = (int)(qp - comm->base.qps);
+#endif
 
       size_t remaining = (size_t)(req->send.size - reqOffset);
       size_t cs = !useFrmNow ? (size_t)scratch->equalChunkSize[0] : (split ? chunkRow[logicalQpIndex] : chunkRow[i]);

@@ -34,6 +34,7 @@ if(OCCL_NET_IB_ENABLE_TESTS)
                 ${CMAKE_BINARY_DIR}/include
                 ${CMAKE_BINARY_DIR}/obj/include
                 ${CUDAToolkit_INCLUDE_DIRS}
+                ${CUDAToolkit_INCLUDE_DIRS}/cccl
         )
 
         target_link_libraries(${target_name}

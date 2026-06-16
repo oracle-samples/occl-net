@@ -295,7 +295,9 @@ static ncclResult_t pluginMakeVDeviceV9(int* d, ncclNetVDeviceProps_v9_t* propsV
   return ncclIbMakeVDevice(d, &props);
 }
 
-extern "C" __attribute__((visibility("default"))) ncclNet_v11_t ncclNetPlugin_v11 = {
+extern "C" {
+
+__attribute__((visibility("default"))) ncclNet_v11_t ncclNetPlugin_v11 = {
   "IB",
   pluginInit,
   pluginDevices,
@@ -320,7 +322,7 @@ extern "C" __attribute__((visibility("default"))) ncclNet_v11_t ncclNetPlugin_v1
   ncclIbSetNetAttr
 };
 
-extern "C" __attribute__((visibility("default"))) ncclNet_v10_t ncclNetPlugin_v10 = {
+__attribute__((visibility("default"))) ncclNet_v10_t ncclNetPlugin_v10 = {
   "IB",
   pluginInitV10,
   pluginDevices,
@@ -343,7 +345,7 @@ extern "C" __attribute__((visibility("default"))) ncclNet_v10_t ncclNetPlugin_v1
   pluginMakeVDeviceV10
 };
 
-extern "C" __attribute__((visibility("default"))) ncclNet_v9_t ncclNetPlugin_v9 = {
+__attribute__((visibility("default"))) ncclNet_v9_t ncclNetPlugin_v9 = {
   "IB",
   pluginInitV9,
   pluginDevices,
@@ -366,7 +368,7 @@ extern "C" __attribute__((visibility("default"))) ncclNet_v9_t ncclNetPlugin_v9 
   pluginMakeVDeviceV9
 };
 
-extern "C" __attribute__((visibility("default"))) ncclNet_v8_t ncclNetPlugin_v8 = {
+__attribute__((visibility("default"))) ncclNet_v8_t ncclNetPlugin_v8 = {
   "IB",
   pluginInitV9,
   pluginDevices,
@@ -388,7 +390,7 @@ extern "C" __attribute__((visibility("default"))) ncclNet_v8_t ncclNetPlugin_v8 
   nullptr
 };
 
-extern "C" __attribute__((visibility("default"))) ncclNet_v7_t ncclNetPlugin_v7 = {
+__attribute__((visibility("default"))) ncclNet_v7_t ncclNetPlugin_v7 = {
   "IB",
   pluginInitV9,
   pluginDevices,
@@ -410,7 +412,7 @@ extern "C" __attribute__((visibility("default"))) ncclNet_v7_t ncclNetPlugin_v7 
   nullptr
 };
 
-extern "C" __attribute__((visibility("default"))) ncclNet_v6_t ncclNetPlugin_v6 = {
+__attribute__((visibility("default"))) ncclNet_v6_t ncclNetPlugin_v6 = {
   "IB",
   pluginInitV9,
   pluginDevices,
@@ -429,3 +431,5 @@ extern "C" __attribute__((visibility("default"))) ncclNet_v6_t ncclNetPlugin_v6 
   pluginCloseRecv,
   pluginCloseListen
 };
+
+}

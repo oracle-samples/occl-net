@@ -33,8 +33,6 @@ add_executable(net_ib_single_node_tests
     ${CMAKE_SOURCE_DIR}/src/misc/utils.cc
     ${CMAKE_SOURCE_DIR}/src/misc/nvmlwrap.cc
     ${CMAKE_SOURCE_DIR}/src/misc/gdrwrap.cc
-    ${CMAKE_SOURCE_DIR}/src/param/param.cc
-    ${CMAKE_SOURCE_DIR}/src/param/param_registry.cc
     ${CMAKE_SOURCE_DIR}/src/debug.cc
     ${CMAKE_SOURCE_DIR}/src/os/linux.cc
 )
@@ -52,6 +50,7 @@ target_include_directories(net_ib_single_node_tests
         ${CMAKE_BINARY_DIR}/include
         ${CMAKE_BINARY_DIR}/obj/include
         ${CUDAToolkit_INCLUDE_DIRS}
+        ${CUDAToolkit_INCLUDE_DIRS}/cccl
 )
 
 target_link_libraries(net_ib_single_node_tests

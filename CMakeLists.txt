@@ -1,365 +1,327 @@
+# Copyright (c) 2026 OCCL-net.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 cmake_minimum_required(VERSION 3.22.1)
 
-# Version information
-# Read makefiles/version.mk file
-file(READ ${CMAKE_SOURCE_DIR}/makefiles/version.mk VERSION_CONTENT)
-string(REGEX REPLACE ".*NCCL_MAJOR[ ]*:=[ ]*([0-9]+).*" "\\1" NCCL_MAJOR "${VERSION_CONTENT}")
-string(REGEX REPLACE ".*NCCL_MINOR[ ]*:=[ ]*([0-9]+).*" "\\1" NCCL_MINOR "${VERSION_CONTENT}")
-string(REGEX REPLACE ".*NCCL_PATCH[ ]*:=[ ]*([0-9]+).*" "\\1" NCCL_PATCH "${VERSION_CONTENT}")
-string(REGEX REPLACE ".*NCCL_SUFFIX[ ]*:=[ ]*([a-zA-Z0-9]*).*" "\\1" NCCL_SUFFIX "${VERSION_CONTENT}")
-string(REGEX REPLACE ".*PKG_REVISION[ ]*:=[ ]*([0-9]+).*" "\\1" PKG_REVISION "${VERSION_CONTENT}")
-math(EXPR NCCL_VERSION_CODE "(${NCCL_MAJOR} * 10000) + (${NCCL_MINOR} * 100) + ${NCCL_PATCH}")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/makefiles/version.mk" occl_version_content)
+string(REGEX REPLACE ".*NCCL_MAJOR[ ]*:=[ ]*([0-9]+).*" "\\1" occl_major "${occl_version_content}")
+string(REGEX REPLACE ".*NCCL_MINOR[ ]*:=[ ]*([0-9]+).*" "\\1" occl_minor "${occl_version_content}")
+string(REGEX REPLACE ".*NCCL_PATCH[ ]*:=[ ]*([0-9]+).*" "\\1" occl_patch "${occl_version_content}")
+string(REGEX REPLACE ".*NCCL_SUFFIX[ ]*:=[ ]*([a-zA-Z0-9]*).*" "\\1" occl_suffix "${occl_version_content}")
+math(EXPR occl_version_code "(${occl_major} * 10000) + (${occl_minor} * 100) + ${occl_patch}")
 
-# Make version information available to C++ source files
-add_compile_definitions(
-    NCCL_USE_CMAKE
-    NCCL_MAJOR=${NCCL_MAJOR}
-    NCCL_MINOR=${NCCL_MINOR}
-    NCCL_PATCH=${NCCL_PATCH}
-    NCCL_VERSION_CODE=${NCCL_VERSION_CODE}
+project(OCCLNetIbPlugin
+  VERSION "${occl_major}.${occl_minor}.${occl_patch}"
+  LANGUAGES CXX C
 )
-
-set(ENV{NCCL_USE_CMAKE} "1")
-
-project(NCCL VERSION ${NCCL_MAJOR}.${NCCL_MINOR}.${NCCL_PATCH}
-        LANGUAGES CUDA CXX C)
 
 include(GNUInstallDirs)
 
-# Make CMAKE_BUILD_TYPE to release by default if not set
 if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE "Release")
+  set(CMAKE_BUILD_TYPE "Release")
 endif()
 
-# Package building options
-option(BUILD_DEBIAN_PACKAGE "Build Debian package" OFF)
-option(BUILD_REDHAT_PACKAGE "Build Redhat package" OFF)
-option(BUILD_TXZ_PACKAGE "Build TXZ package" OFF)
-option(BUILD_CONDA_PACKAGE "Build Conda package" OFF)
-option(BUILD_SRCTXZ_PACKAGE "Build source tarball package" OFF)
-option(BUILD_DOC_PACKAGE "Build documentation package" OFF)
-option(BUILD_PACKAGES "Build all packages" OFF)
-option(VERBOSE "Enable verbose output" OFF)
-option(KEEP "Keep intermediate files" OFF)
-option(DEBUG "Enable debug build" OFF)
-option(ASAN "Enable Address Sanitizer" OFF)
-option(UBSAN "Enable Undefined Behavior Sanitizer" OFF)
+option(BUILD_IB_TRANSPORT_PLUGIN "Build the standalone IB transport plugin" ON)
 option(TRACE "Enable tracing" OFF)
 option(WERROR "Treat warnings as errors" OFF)
-option(PROFAPI "Enable profiling API" ON)
-option(NVTX "Enable NVTX" ON)
-option(RDMA_CORE "Enable RDMA core" OFF)
 option(NET_PROFILER "Enable network profiler" OFF)
+option(RDMA_CORE "Enable RDMA core" OFF)
 option(MLX5DV "Enable MLX5DV" OFF)
 option(MAX_EXT_NET_PLUGINS "Maximum external network plugins" 0)
-option(EMIT_LLVM_IR "Generate LLVM IR for device APIs" OFF)
-option(BUILD_NCCL4PY "Enable nccl4py Python bindings targets" OFF)
-option(BUILD_NCCL_EP "Build NCCL EP contrib library" OFF)
+option(OCCL_PLUGIN_STATIC_CUDART "Compatibility knob for older standalone plugin builds; ignored because this build does not link a GPU runtime" ON)
+option(OCCL_PLUGIN_STATIC_CXX_RUNTIME "Link the standalone IB transport plugin against static libstdc++ when supported while keeping libgcc shared" ON)
 option(OCCL_NET_IB_ENABLE_TESTS "Build OCCL Net IB GoogleTest targets" OFF)
 option(OCCL_NET_IB_ENABLE_SINGLE_NODE_TESTS "Build OCCL Net IB GPU-local single-node GoogleTest targets" OFF)
-option(OCCL_NET_IB_ENABLE_COVERAGE "Build OCCL Net IB targets with gcov/lcov coverage instrumentation" OFF)
+option(OCCL_NET_IB_ENABLE_COVERAGE "Build net-IB transport sources with gcov/lcov coverage instrumentation" OFF)
+set(OCCL_NET_IB_PLUGIN_VERSION "0.1.0" CACHE STRING "Version string embedded in the standalone IB transport plugin")
 
 if(OCCL_NET_IB_ENABLE_COVERAGE)
-    set(OCCL_NET_IB_ENABLE_TESTS ON CACHE BOOL "Build OCCL Net IB GoogleTest targets" FORCE)
-    set(OCCL_NET_IB_ENABLE_SINGLE_NODE_TESTS ON CACHE BOOL "Build OCCL Net IB GPU-local single-node GoogleTest targets" FORCE)
+  set(OCCL_NET_IB_ENABLE_TESTS ON CACHE BOOL "Build OCCL Net IB GoogleTest targets" FORCE)
+  set(OCCL_NET_IB_ENABLE_SINGLE_NODE_TESTS ON CACHE BOOL "Build OCCL Net IB GPU-local single-node GoogleTest targets" FORCE)
 endif()
 
 if(OCCL_NET_IB_ENABLE_TESTS OR OCCL_NET_IB_ENABLE_SINGLE_NODE_TESTS)
-    enable_testing()
+  enable_testing()
+  include(CTest)
 endif()
 
-# Detect OS
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    set(NCCL_OS_WINDOWS ON)
-    add_definitions(-DNCCL_OS_WINDOWS)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(NCCL_OS_LINUX ON)
-    add_definitions(-DNCCL_OS_LINUX)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "The standalone IB transport plugin build currently supports Linux only")
+endif()
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  set(occl_compiler_gcc ON)
 else()
-    message(FATAL_ERROR "Unsupported OS: ${CMAKE_SYSTEM_NAME}")
+  message(FATAL_ERROR "The standalone IB transport plugin build currently requires GCC or Clang")
 endif()
 
-# Detect compiler
-if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-    set(NCCL_COMPILER_MSVC ON)
-    add_definitions(-DNCCL_COMPILER_MSVC)
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    set(NCCL_COMPILER_GCC ON)
-    add_definitions(-DNCCL_COMPILER_GCC)
-else()
-    message(FATAL_ERROR "Unsupported compiler: ${CMAKE_CXX_COMPILER_ID}")
-endif()
-
-if(OCCL_NET_IB_ENABLE_COVERAGE AND NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang"))
-    message(FATAL_ERROR "OCCL_NET_IB_ENABLE_COVERAGE requires GCC or Clang")
-endif()
-
-# Reconfigure safely when the build directory was first generated in a
-# different Linux container image and now holds missing absolute library paths.
 set(stale_cache_file_vars
-    CUDAToolkit_rt_LIBRARY
-    RT_LIBRARY
+  CUDAToolkit_rt_LIBRARY
+  RT_LIBRARY
 )
 foreach(stale_cache_file_var IN LISTS stale_cache_file_vars)
-    get_property(stale_cache_file_type CACHE "${stale_cache_file_var}" PROPERTY TYPE)
-    if(stale_cache_file_type)
-        get_property(stale_cache_file_path CACHE "${stale_cache_file_var}" PROPERTY VALUE)
-        if(stale_cache_file_path AND NOT EXISTS "${stale_cache_file_path}")
-            message(STATUS "Clearing stale cache entry ${stale_cache_file_var}=${stale_cache_file_path}")
-            unset(${stale_cache_file_var} CACHE)
-        endif()
+  get_property(stale_cache_file_type CACHE "${stale_cache_file_var}" PROPERTY TYPE)
+  if(stale_cache_file_type)
+    get_property(stale_cache_file_path CACHE "${stale_cache_file_var}" PROPERTY VALUE)
+    if(stale_cache_file_path AND NOT EXISTS "${stale_cache_file_path}")
+      message(STATUS "Clearing stale cache entry ${stale_cache_file_var}=${stale_cache_file_path}")
+      unset(${stale_cache_file_var} CACHE)
     endif()
+  endif()
 endforeach()
 
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
-# CUDA version detection
-string(REGEX MATCH "([0-9]+\\.[0-9]+)" CUDA_VERSION "${CUDAToolkit_VERSION}")
+string(REGEX MATCH "([0-9]+\\.[0-9]+)" cuda_version "${CUDAToolkit_VERSION}")
+string(REGEX MATCH "([0-9]+)" cuda_major "${cuda_version}")
+string(REGEX REPLACE ".*\\.([0-9]+)$" "\\1" cuda_minor "${cuda_version}")
 
-# Extract major and minor version numbers
-string(REGEX MATCH "([0-9]+)" CUDA_MAJOR "${CUDA_VERSION}")
-string(REGEX MATCH "([0-9]+)$" CUDA_MINOR "${CUDA_VERSION}")
-string(REGEX REPLACE ".*\\.([0-9]+)$" "\\1" CUDA_MINOR "${CUDA_VERSION}")
-
-# Add CUDA version definitions after find_package
-add_compile_definitions(
-    CUDA_MAJOR=${CUDA_MAJOR}
-    CUDA_MINOR=${CUDA_MINOR}
-)
-
-# CUDA 13.0 requires C++17
-if(${CUDA_MAJOR} GREATER_EQUAL 13)
-    set(CMAKE_CXX_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD 17)
+if(${cuda_major} GREATER_EQUAL 13)
+  set(CMAKE_CXX_STANDARD 17)
 else()
-    set(CMAKE_CXX_STANDARD 14)
-    set(CMAKE_CUDA_STANDARD 14)
+  set(CMAKE_CXX_STANDARD 14)
 endif()
-
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# CUDA architecture flags
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-    message(STATUS "CMAKE_CUDA_ARCHITECTURES not defined or empty, setting default values based on CUDA version")
+add_compile_definitions(
+  NCCL_USE_CMAKE
+  NCCL_OS_LINUX
+  NCCL_COMPILER_GCC
+  NCCL_MAJOR=${occl_major}
+  NCCL_MINOR=${occl_minor}
+  NCCL_PATCH=${occl_patch}
+  NCCL_VERSION_CODE=${occl_version_code}
+  CUDA_MAJOR=${cuda_major}
+  CUDA_MINOR=${cuda_minor}
+  DOCA_VERBS_USE_CUDA_WRAPPER
+  DOCA_VERBS_USE_NET_WRAPPER
+  NCCL_GIN_PROXY_ENABLE=1
+)
+set(ENV{NCCL_USE_CMAKE} "1")
 
-    if(${CUDA_MAJOR} LESS 9)
-        set(CMAKE_CUDA_ARCHITECTURES "35;50;60;61")
-    elseif(${CUDA_MAJOR} EQUAL 9)
-        set(CMAKE_CUDA_ARCHITECTURES "35;50;60;61;70")
-    elseif(${CUDA_MAJOR} EQUAL 10)
-        set(CMAKE_CUDA_ARCHITECTURES "35;50;60;61;70")
-    elseif(${CUDA_MAJOR} EQUAL 11)
-        if(${CUDA_MINOR} LESS 8)
-            set(CMAKE_CUDA_ARCHITECTURES "35;50;60;61;70;80")
-        else()
-            set(CMAKE_CUDA_ARCHITECTURES "35;50;60;61;70;80;90")
-        endif()
-    elseif(${CUDA_MAJOR} EQUAL 12)
-        if(${CUDA_MINOR} LESS 8)
-            set(CMAKE_CUDA_ARCHITECTURES "50;60;61;70;80;90")
-        else()
-            set(CMAKE_CUDA_ARCHITECTURES "50;60;61;70;80;90;100;120")
-        endif()
-    elseif(${CUDA_MAJOR} EQUAL 13)
-        set(CMAKE_CUDA_ARCHITECTURES "50;60;61;70;80;90;100;110;120")
-    else()
-        # For future CUDA versions, include all architectures up to the latest known
-        set(CMAKE_CUDA_ARCHITECTURES "50;60;61;70;80;90;100;110;120")
-    endif()
-endif()
-message(STATUS "Using CUDA_ARCHITECTURES: ${CMAKE_CUDA_ARCHITECTURES}")
-
-# Compiler-specific flags
-if(NCCL_COMPILER_GCC)
-    # GCC/Clang-specific flags
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -fvisibility=hidden -Wall -Wno-unused-function -Wno-sign-compare -Wvla -g")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda -Xptxas -maxrregcount=96 -Xfatbin -compress-all -fPIC")
-elseif(NCCL_COMPILER_MSVC)
-    # MSVC-specific flags
-    # /Zc:preprocessor enables conformant preprocessor for proper variadic macro handling (needed for NVTX)
-    # /wd4146 disables "unary minus on unsigned" warning - intentional for two's complement and alignment masks
-    # /wd4197 disables "top-level volatile in cast ignored" - benign when using atomic intrinsics
-    # /wd5105 disables "macro expansion producing 'defined'" - triggered by Windows SDK headers (winbase.h)
-    # /wd4805 disables "unsafe mix of type 'bool' and type 'int'" - intentional bool/int mixing for flags
-    # /wd4018 disables "signed/unsigned mismatch" - safe comparisons where signed value is always positive
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3 /wd4267 /wd4244 /wd4996 /wd4146 /wd4197 /wd5105 /wd4805 /wd4018 /FS /Zc:preprocessor")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda -Xptxas -maxrregcount=96 --compress-mode=balance")
-endif()
-
-# Sanitizer options (GCC/Clang only)
-if(NCCL_COMPILER_GCC)
-    if(ASAN)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address -static-libasan")
-    endif()
-
-    if(UBSAN)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined")
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=undefined -static-libubsan")
-    endif()
-endif()
-
-# Additional options
 if(TRACE)
-    add_definitions(-DENABLE_TRACE)
-endif()
-
-if(NOT NVTX)
-    add_definitions(-DNVTX_DISABLE)
-endif()
-
-if(WERROR)
-    if(NCCL_COMPILER_MSVC)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /WX")
-    else()
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
-    endif()
-endif()
-
-if(PROFAPI)
-    add_definitions(-DPROFAPI)
-endif()
-
-set(EXTRA_LIBS)
-
-# RDMA and MLX5DV are Linux-specific features
-if(RDMA_CORE)
-    add_definitions(-DNCCL_BUILD_RDMA_CORE=1)
-    find_library(VERBS_LIBRARY NAMES verbs)
-    if(VERBS_LIBRARY)
-        list(APPEND EXTRA_LIBS verbs)
-    endif()
-endif()
-
-if(MLX5DV)
-    add_definitions(-DNCCL_BUILD_MLX5DV=1)
-    find_library(MLX5_LIBRARY NAMES mlx5)
-    if(MLX5_LIBRARY)
-        list(APPEND EXTRA_LIBS mlx5)
-    endif()
+  add_compile_definitions(ENABLE_TRACE)
 endif()
 
 if(NET_PROFILER)
-    add_definitions(-DNCCL_ENABLE_NET_PROFILING=1)
+  add_compile_definitions(NCCL_ENABLE_NET_PROFILING=1)
 endif()
 
 if(MAX_EXT_NET_PLUGINS GREATER 0)
-    add_definitions(-DNCCL_NET_MAX_PLUGINS=${MAX_EXT_NET_PLUGINS})
+  add_compile_definitions(NCCL_NET_MAX_PLUGINS=${MAX_EXT_NET_PLUGINS})
 endif()
 
-add_definitions(-DDOCA_VERBS_USE_CUDA_WRAPPER)
-add_definitions(-DDOCA_VERBS_USE_NET_WRAPPER)
-add_definitions(-DNCCL_GIN_PROXY_ENABLE=1)
-if(EMIT_LLVM_IR)
-    add_definitions(-DEMIT_LLVM_IR=1)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -fvisibility=hidden -Wall -Wno-unused-function -Wno-sign-compare -Wvla -g")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} -O0")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -O3")
+
+if(WERROR)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
 endif()
 
-# Library dependencies
+set(extra_libs)
+if(RDMA_CORE)
+  add_compile_definitions(NCCL_BUILD_RDMA_CORE=1)
+  find_library(VERBS_LIBRARY NAMES verbs)
+  if(VERBS_LIBRARY)
+    list(APPEND extra_libs verbs)
+  endif()
+endif()
+
+if(MLX5DV)
+  add_compile_definitions(NCCL_BUILD_MLX5DV=1)
+  find_library(MLX5_LIBRARY NAMES mlx5)
+  if(MLX5_LIBRARY)
+    list(APPEND extra_libs mlx5)
+  endif()
+endif()
+
 find_library(RT_LIBRARY NAMES rt)
 if(RT_LIBRARY)
-    list(APPEND EXTRA_LIBS rt)
+  list(APPEND extra_libs rt)
 endif()
+set(EXTRA_LIBS ${extra_libs})
 
-# Debug/Release specific flags
-if(NCCL_COMPILER_GCC)
-    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} -O0")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -O3")
-elseif(NCCL_COMPILER_MSVC)
-    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} /Od /Zi /FS")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} /O2 /FS")   # Maximum available optimization for MSVC
-endif()
+set(generated_include_dir "${CMAKE_BINARY_DIR}/include")
+set(generated_obj_include_dir "${CMAKE_BINARY_DIR}/obj/include")
+file(MAKE_DIRECTORY "${generated_include_dir}" "${generated_obj_include_dir}")
 
-set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS} -O0 -G -g")
-set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS} -O3")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/nccl.h.in" generated_api_header)
+string(REPLACE "\${nccl:Major}" "${occl_major}" generated_api_header "${generated_api_header}")
+string(REPLACE "\${nccl:Minor}" "${occl_minor}" generated_api_header "${generated_api_header}")
+string(REPLACE "\${nccl:Patch}" "${occl_patch}" generated_api_header "${generated_api_header}")
+string(REPLACE "\${nccl:Suffix}" "${occl_suffix}" generated_api_header "${generated_api_header}")
+string(REPLACE "\${nccl:Version}" "${occl_version_code}" generated_api_header "${generated_api_header}")
+file(WRITE "${generated_include_dir}/nccl.h" "${generated_api_header}")
 
-add_subdirectory(plugins/mixed/example)
-add_subdirectory(plugins/net)
-add_subdirectory(plugins/profiler/example)
-add_subdirectory(plugins/tuner/example)
-add_subdirectory(plugins/env/example)
-add_subdirectory(src)
+add_custom_target(nccl_header
+  DEPENDS "${generated_include_dir}/nccl.h"
+)
 
-if(OCCL_NET_IB_ENABLE_COVERAGE)
-  add_custom_target(net_ib_coverage
-    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/run_net_ib_tests.sh --coverage ${CMAKE_BINARY_DIR}
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    COMMENT "Generating net-IB coverage report"
-    USES_TERMINAL
+set(git_version_file "${generated_obj_include_dir}/nccl_git_version.h")
+add_custom_command(
+  OUTPUT "${git_version_file}"
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/src/misc/generate_git_version.py" "${git_version_file}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/misc/generate_git_version.py"
+  COMMENT "Checking git version"
+)
+add_custom_target(generate_git_version
+  DEPENDS "${git_version_file}"
+)
+
+if(BUILD_IB_TRANSPORT_PLUGIN)
+  include(CMakePushCheckState)
+  include(CheckCXXSourceCompiles)
+
+  set(occl_plugin_cxx_runtime_linkage "dynamic")
+  set(occl_plugin_cxx_runtime_link_options)
+  if(OCCL_PLUGIN_STATIC_CXX_RUNTIME)
+    unset(OCCL_PLUGIN_CAN_STATIC_LINK_CXX_RUNTIME CACHE)
+    unset(OCCL_PLUGIN_CAN_STATIC_LINK_CXX_RUNTIME)
+    cmake_push_check_state(RESET)
+    list(APPEND CMAKE_REQUIRED_LINK_OPTIONS
+      "-static-libstdc++"
+    )
+    check_cxx_source_compiles("
+      #include <string>
+      int main() {
+        std::string s = \"occl\";
+        return s.size() == 4 ? 0 : 1;
+      }
+    " OCCL_PLUGIN_CAN_STATIC_LINK_CXX_RUNTIME)
+    cmake_pop_check_state()
+    if(OCCL_PLUGIN_CAN_STATIC_LINK_CXX_RUNTIME)
+      set(occl_plugin_cxx_runtime_linkage "static-libstdc++/shared-libgcc")
+      list(APPEND occl_plugin_cxx_runtime_link_options
+        "-static-libstdc++"
+      )
+    else()
+      message(WARNING "OCCL_PLUGIN_STATIC_CXX_RUNTIME=ON but the current toolchain cannot link a trivial C++ program with -static-libstdc++; using dynamic C++ runtime for occl-net-ib-plugin")
+    endif()
+  endif()
+
+  if(OCCL_PLUGIN_STATIC_CUDART)
+    message(STATUS "occl-net-ib-plugin GPU runtime linkage: disabled (OCCL_PLUGIN_STATIC_CUDART is ignored for the host-only standalone build)")
+  else()
+    message(STATUS "occl-net-ib-plugin GPU runtime linkage: disabled (host-side verbs plus DMA-BUF)")
+  endif()
+  message(STATUS "occl-net-ib-plugin C++ runtime linkage: ${occl_plugin_cxx_runtime_linkage}")
+
+  set(ib_transport_plugin_net_ib_sources
+    src/transport/net_ib/common.cc
+    src/transport/net_ib/connect.cc
+    src/transport/net_ib/gdr.cc
+    src/transport/net_ib/init.cc
+    src/transport/net_ib/p2p.cc
+    src/transport/net_ib/p2p_resiliency.cc
+    src/transport/net_ib/reg.cc
+  )
+
+  set(ib_transport_plugin_sources
+    src/plugin/net/net_ib_plugin_v11.cc
+    src/plugin/net/net_ib_plugin_stubs.cc
+    src/transport/net_ib/cim.cc
+    ${ib_transport_plugin_net_ib_sources}
+    src/misc/socket.cc
+    src/misc/ibvwrap.cc
+    src/misc/ibvsymbols.cc
+    src/misc/mlx5dvwrap.cc
+    src/misc/mlx5dvsymbols.cc
+    src/misc/param.cc
+    src/misc/utils.cc
+    src/misc/nvmlwrap.cc
+    src/misc/gdrwrap.cc
+    src/debug.cc
+    src/os/linux.cc
+  )
+
+  add_library(occl-net-ib-plugin SHARED
+    ${ib_transport_plugin_sources}
+  )
+
+  target_include_directories(occl-net-ib-plugin
+    PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/include/plugin"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/transport/net_ib"
+      "${generated_include_dir}"
+      "${generated_obj_include_dir}"
+      "${CUDAToolkit_INCLUDE_DIRS}"
+      "${CUDAToolkit_INCLUDE_DIRS}/cccl"
+  )
+
+  target_compile_definitions(occl-net-ib-plugin PRIVATE
+    OCCL_DISABLE_CUDA_RUNTIME=1
+    OCCL_NET_IB_PLUGIN_VERSION="${OCCL_NET_IB_PLUGIN_VERSION}"
+  )
+
+  target_link_libraries(occl-net-ib-plugin
+    PRIVATE
+      Threads::Threads
+      ${CMAKE_DL_LIBS}
+      ${extra_libs}
+  )
+
+  set(occl_net_ib_plugin_version_script
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/net/occl-net-ib-plugin.map"
+  )
+  target_link_options(occl-net-ib-plugin PRIVATE
+    "-Wl,--no-undefined"
+    "-Wl,--exclude-libs,ALL"
+    "-Wl,--version-script=${occl_net_ib_plugin_version_script}"
+    ${occl_plugin_cxx_runtime_link_options}
+  )
+  set_property(TARGET occl-net-ib-plugin APPEND PROPERTY
+    LINK_DEPENDS "${occl_net_ib_plugin_version_script}"
+  )
+
+  if(OCCL_NET_IB_ENABLE_COVERAGE)
+    foreach(ib_transport_plugin_net_ib_source IN LISTS ib_transport_plugin_net_ib_sources)
+      set_source_files_properties(${ib_transport_plugin_net_ib_source} PROPERTIES
+        COMPILE_OPTIONS "-O0;-g;--coverage"
+      )
+    endforeach()
+    target_link_options(occl-net-ib-plugin PRIVATE --coverage)
+  endif()
+
+  add_dependencies(occl-net-ib-plugin nccl_header generate_git_version)
+
+  set_target_properties(occl-net-ib-plugin PROPERTIES
+    OUTPUT_NAME "occl-net-ib"
+    PREFIX "lib"
+    POSITION_INDEPENDENT_CODE ON
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  )
+
+  install(TARGETS occl-net-ib-plugin
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
   )
 endif()
 
-# Add package building subdirectories
-if(BUILD_DEBIAN_PACKAGE OR BUILD_PACKAGES)
-  add_subdirectory(pkg/debian)
+if(OCCL_NET_IB_ENABLE_TESTS OR OCCL_NET_IB_ENABLE_SINGLE_NODE_TESTS)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third-party/googletest/CMakeLists.txt")
+    message(FATAL_ERROR "Net-IB tests require the third-party/googletest submodule. Run `git submodule update --init third-party/googletest`.")
+  endif()
+
+  set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+  add_subdirectory(
+    "${CMAKE_CURRENT_SOURCE_DIR}/third-party/googletest"
+    "${CMAKE_BINARY_DIR}/third-party/googletest"
+    EXCLUDE_FROM_ALL
+  )
+  add_subdirectory(src/transport/net_ib/test)
 endif()
-
-if(BUILD_REDHAT_PACKAGE OR BUILD_PACKAGES)
-  add_subdirectory(pkg/redhat)
-endif()
-
-if(BUILD_TXZ_PACKAGE OR BUILD_PACKAGES)
-  add_subdirectory(pkg/txz)
-endif()
-
-if(BUILD_CONDA_PACKAGE OR BUILD_PACKAGES)
-  add_subdirectory(pkg/conda)
-endif()
-
-if(BUILD_SRCTXZ_PACKAGE OR BUILD_PACKAGES)
-  add_subdirectory(pkg/srctxz)
-endif()
-
-if(BUILD_DOC_PACKAGE OR BUILD_PACKAGES)
-  add_subdirectory(pkg/doc)
-endif()
-
-if(EMIT_LLVM_IR)
-    add_subdirectory(bindings/ir)
-    add_dependencies(llvm_ir nccl_header)
-    add_custom_target(nccl_with_ir ALL DEPENDS nccl llvm_ir)
-    message(STATUS "LLVM IR generation will be included in default build")
-endif()
-
-if(BUILD_NCCL4PY)
-  add_subdirectory(bindings/nccl4py)
-endif()
-
-###################### CMake package config for find_package(NCCL) ######################
-include(CMakePackageConfigHelpers)
-
-set(NCCL_CMAKE_CONFIG_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/NCCL")
-
-# Export installed targets (NCCL::nccl, NCCL::nccl_static)
-install(EXPORT NCCLTargets
-  FILE NCCLTargets.cmake
-  NAMESPACE NCCL::
-  DESTINATION "${NCCL_CMAKE_CONFIG_DIR}"
-)
-
-# Generate & install NCCLConfig.cmake / NCCLConfigVersion.cmake
-configure_package_config_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/NCCLConfig.cmake.in"
-  "${CMAKE_CURRENT_BINARY_DIR}/NCCLConfig.cmake"
-  INSTALL_DESTINATION "${NCCL_CMAKE_CONFIG_DIR}"
-)
-
-write_basic_package_version_file(
-  "${CMAKE_CURRENT_BINARY_DIR}/NCCLConfigVersion.cmake"
-  VERSION "${PROJECT_VERSION}"
-  COMPATIBILITY SameMajorVersion
-)
-
-install(FILES
-  "${CMAKE_CURRENT_BINARY_DIR}/NCCLConfig.cmake"
-  "${CMAKE_CURRENT_BINARY_DIR}/NCCLConfigVersion.cmake"
-  DESTINATION "${NCCL_CMAKE_CONFIG_DIR}"
-)
-
-# Also export targets for build-tree usage (optional convenience).
-export(EXPORT NCCLTargets
-  FILE "${CMAKE_CURRENT_BINARY_DIR}/NCCLTargets.cmake"
-  NAMESPACE NCCL::
-)
