@@ -8,7 +8,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 {
     "name": "OCCL Net Plugin - Linux Release (x86_64)",
     "build": {
@@ -43,8 +42,7 @@
                 "ms-vscode.cpptools",
                 "ms-vscode.cmake-tools",
                 "timonwong.shellcheck",
-                "xaver.clang-format",
-                "${containerWorkspaceFolder}/.vscode/extensions/octo-0.0.25.vsix"
+                "xaver.clang-format"
             ],
             "settings": {
                 "C_Cpp.intelliSenseEngine": "disabled",
