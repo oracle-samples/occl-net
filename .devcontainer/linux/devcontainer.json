@@ -9,7 +9,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 {
-    "name": "OCCL Net Plugin - Linux Release (x86_64)",
+    "name": "OCCL Net Plugin - Linux Release",
     "build": {
         "dockerfile": "../Dockerfile.linux",
         "target": "vscode-dev",
@@ -32,7 +32,7 @@
     ],
     "containerEnv": {
         "OCCL_NET_HOST_WORKSPACE": "${localWorkspaceFolder}",
-        "OCCL_NET_RELEASE_BUILDER_IMAGE": "occl-net-linux-release-builder:latest"
+        "OCCL_NET_RELEASE_BUILDER_IMAGE_TEMPLATE": "occl-net-linux-release-builder:%ARCH%"
     },
     "postCreateCommand": "git config --global --add safe.directory '*'",
     "customizations": {

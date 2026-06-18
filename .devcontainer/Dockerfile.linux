@@ -11,11 +11,12 @@
 
 # Invalidate cache to prevent architecture-specific layer collisions.
 ARG TARGET_ARCH_CACHE
+ARG ARM64_RELEASE_BASE_IMAGE=nvidia/cuda:13.1.1-cudnn-devel-oraclelinux8
 
 # CUDA 12.4 is the newest CUDA line qualified for a CentOS 7 / glibc 2.17
-# builder. Artifacts built here keep an OL7-compatible libc floor and are
-# validated separately on CUDA 13-class runtime hosts.
-FROM nvidia/cuda:12.4.0-devel-centos7 AS release-builder
+# builder. x86_64 artifacts built here keep an OL7-compatible libc floor and
+# are validated separately on CUDA 13-class runtime hosts.
+FROM nvidia/cuda:12.4.0-devel-centos7 AS release-builder-amd64
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -123,6 +124,61 @@ RUN set -eux; \
 RUN set -eux; \
     curl -fsSL -o /tmp/cmake.sh \
       "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.sh"; \
+    sh /tmp/cmake.sh --skip-license --prefix=/usr/local; \
+    rm -f /tmp/cmake.sh; \
+    cmake --version
+
+WORKDIR /workspace
+
+FROM release-builder-amd64 AS release-builder
+
+# CentOS 7 CUDA images are x86_64-only. Use a CUDA 13-class OL8 ARM64 Linux
+# builder for native aarch64 release artifacts targeting GB200/B200-class
+# hosts. Override ARM64_RELEASE_BASE_IMAGE to use another ARM64 CUDA builder.
+FROM ${ARM64_RELEASE_BASE_IMAGE} AS release-builder-arm64
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG CMAKE_VERSION=3.27.9
+
+RUN set -eux; \
+    dnf --enablerepo=ol8_codeready_builder install -y \
+      binutils \
+      bzip2 \
+      ca-certificates \
+      curl \
+      file \
+      findutils \
+      gcc \
+      gcc-c++ \
+      git \
+      libstdc++-static \
+      make \
+      ninja-build \
+      openssh-clients \
+      patch \
+      perl \
+      pkgconf-pkg-config \
+      python3 \
+      rsync \
+      tar \
+      unzip \
+      wget \
+      which \
+      xz \
+      zlib-devel; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf
+
+# Install a modern CMake without depending on the distribution CMake version.
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64) cmake_arch="linux-x86_64" ;; \
+      aarch64) cmake_arch="linux-aarch64" ;; \
+      *) echo "unsupported CMake bootstrap architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/cmake.sh \
+      "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-${cmake_arch}.sh"; \
     sh /tmp/cmake.sh --skip-license --prefix=/usr/local; \
     rm -f /tmp/cmake.sh; \
     cmake --version
