@@ -10,7 +10,7 @@
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
 NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
-NCCL_PARAM(OciFrmEnable, "OCI_FRM_ENABLE", 0);
+NCCL_PARAM(OciFrmEnable, "OCI_FRM_ENABLE", 1);
 
 double g_inv_cyc_per_us = 0.0;
 bool g_ncclIbUseCim = false;

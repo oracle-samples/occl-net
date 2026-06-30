@@ -17,8 +17,8 @@ enum ncclIbRequestMatchingScheme {
 
 
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
-// By default, use ncclIbRequestMatchingScheme::BY_INDEX matching scheme.
-NCCL_PARAM(IbReceiverSideMatchingScheme, "IB_RECEIVER_SIDE_MATCHING_SCHEME", 0);
+// By default, use ncclIbRequestMatchingScheme::BY_ID matching scheme.
+NCCL_PARAM(IbReceiverSideMatchingScheme, "IB_RECEIVER_SIDE_MATCHING_SCHEME", 1);
 NCCL_PARAM(FrmSpreadEpsUs, "FRM_SPREAD_EPS_US", 4);
 NCCL_PARAM(FrmZeroStampHoldoff, "FRM_ZERO_STAMP_HOLDOFF", 2);
 
