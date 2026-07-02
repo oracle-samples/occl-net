@@ -241,9 +241,9 @@ TEST_F(ResiliencyFixture, StatePredicatesMasksAndBackoffHelpersAreStable) {
   EXPECT_EQ(ctx.peerReadyReadQpIndex, -1);
   EXPECT_EQ(ctx.peerReadyReadDevIndex, -1);
 
-  EXPECT_EQ(ncclIbResiliencyQpRejoinCooldownNs(), 10ULL * MSEC_TO_NSEC);
-  EXPECT_EQ(ncclIbResiliencyPeerReadyBackoffNs(0), 10ULL * MSEC_TO_NSEC);
-  EXPECT_EQ(ncclIbResiliencyPeerReadyBackoffNs(3), 30ULL * MSEC_TO_NSEC);
+  EXPECT_EQ(ncclIbResiliencyQpRejoinCooldownNs(), 1000ULL * MSEC_TO_NSEC);
+  EXPECT_EQ(ncclIbResiliencyPeerReadyBackoffNs(0), 1000ULL * MSEC_TO_NSEC);
+  EXPECT_EQ(ncclIbResiliencyPeerReadyBackoffNs(3), 3000ULL * MSEC_TO_NSEC);
 }
 
 TEST_F(ResiliencyFixture, ErrorFatalityAndReplacementRespectOneFailedDevice) {

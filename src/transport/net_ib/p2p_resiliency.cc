@@ -11,7 +11,7 @@
 
 NCCL_PARAM(IbResiliencyPortFailover, "IB_RESILIENCY_PORT_FAILOVER", 1);
 NCCL_PARAM(IbResiliencyPortFailoverMaxAttempts, "IB_RESILIENCY_PORT_FAILOVER_MAX_ATTEMPTS", 1);
-NCCL_PARAM(IbResiliencyPortFailoverProbeDelay, "IB_RESILIENCY_PORT_FAILOVER_PROBE_DELAY", 10); // In milliseconds
+NCCL_PARAM(IbResiliencyPortFailoverProbeDelay, "IB_RESILIENCY_PORT_FAILOVER_PROBE_DELAY", 1000); // In milliseconds
 
 #define MSEC_TO_NSEC 1000000ULL
 #define IB_RESILIENCY_READY_QP_WORDS ((NCCL_IB_MAX_QPS + 63) / 64)
