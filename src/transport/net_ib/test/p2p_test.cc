@@ -15,6 +15,8 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <cstring>
+
 namespace {
 
 ncclIbSendComm MakeSendComm() {
@@ -114,4 +116,41 @@ TEST(NetIbP2pTest, FreeRequestMarksSlotUnused) {
 
   EXPECT_EQ(ncclIbFreeRequest(&request), ncclSuccess);
   EXPECT_EQ(request.type, NCCL_NET_IB_REQ_UNUSED);
+}
+
+TEST(NetIbP2pTest,
+     SuccessfulNonResilientCtsAfterSlotReuseDoesNotTouchReplacement) {
+  ncclIbRecvComm receive = {};
+  ncclIbNetCommBase* base = &receive.base;
+  base->isSend = false;
+  ASSERT_EQ(base->resiliency, nullptr);
+
+  constexpr uint64_t staleRequestId = 23;
+  constexpr uint64_t replacementRequestId =
+      staleRequestId + NET_IB_MAX_REQUESTS;
+  constexpr int requestSlot = staleRequestId % NET_IB_MAX_REQUESTS;
+  ncclIbRequest* replacement = &base->reqs[requestSlot];
+  replacement->base = base;
+  replacement->id = replacementRequestId;
+  replacement->type = NCCL_NET_IB_REQ_RECV;
+  replacement->nreqs = 2;
+  replacement->events[0] = 9;
+  receive.recvReqs[requestSlot] = replacement;
+  unsigned char replacementBefore[sizeof(*replacement)];
+  std::memcpy(replacementBefore, replacement, sizeof(replacementBefore));
+
+  ibv_wc completion = {};
+  completion.status = IBV_WC_SUCCESS;
+  completion.opcode = IBV_WC_RDMA_WRITE;
+  completion.wr_id = ibReqWrIdEncode(staleRequestId);
+  completion.qp_num = 1201;
+
+  ASSERT_EQ(ncclIbCompletionEventProcess(base, &completion, 0), ncclSuccess);
+  EXPECT_EQ(std::memcmp(replacementBefore, replacement,
+                        sizeof(replacementBefore)), 0);
+  EXPECT_EQ(replacement->type, NCCL_NET_IB_REQ_RECV);
+  EXPECT_EQ(replacement->id, replacementRequestId);
+  EXPECT_EQ(replacement->nreqs, 2);
+  EXPECT_EQ(replacement->events[0], 9);
+  EXPECT_EQ(receive.recvReqs[requestSlot], replacement);
 }

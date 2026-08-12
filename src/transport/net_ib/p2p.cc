@@ -1548,6 +1548,14 @@ static ncclResult_t ncclIbLogCompletionWithError(struct ncclIbNetCommBase* commB
 }
 
 static inline ncclResult_t ncclIbCompletionEventProcess(struct ncclIbNetCommBase* commBase, struct ibv_wc* wc, int devIndex) {
+  // Successful receive-side RDMA writes are CTS completions. They carry no
+  // request-state or receive-queue work, and their request slot may have been
+  // retired or reused before the CQE arrives, so discard them before lookup.
+  // Failed CQEs are excluded and remain on the polling callers' error paths.
+  if (!commBase->isSend &&
+      wc->status == IBV_WC_SUCCESS && wc->opcode == IBV_WC_RDMA_WRITE) {
+    return ncclSuccess;
+  }
 #ifdef ENABLE_TRACE
   union ncclSocketAddress addr;
   ncclSocketGetAddr(&commBase->sock, &addr);
