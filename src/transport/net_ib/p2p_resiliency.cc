@@ -550,8 +550,7 @@ static ncclResult_t ncclIbResiliencyTryRejoinSingleQp(struct ncclIbResiliency* r
   qpInfo->localPortRetryLogged = false;
 
   struct ncclIbNetCommDevBase* devBase = ncclIbGetNetCommDevBase(resCtx->baseComm, qp->devIndex);
-  struct ncclIbDevInfo remDevInfo = resCtx->baseComm->remDevs[qp->remDevIdx];
-  remDevInfo.mtu = std::min(remDevInfo.mtu, localPortMtu);
+  struct ncclIbDevInfo* remDevInfo = &resCtx->baseComm->remDevs[qp->remDevIdx];
   bool fifoTc = !resCtx->baseComm->isSend;
 
   ncclResult_t res = ncclIbResiliencyQpToReset(qp->qp);
@@ -575,7 +574,7 @@ static ncclResult_t ncclIbResiliencyTryRejoinSingleQp(struct ncclIbResiliency* r
            __func__, qpIndex, qp->qp->qp_num, qp->devIndex, resCtx->baseComm);
     }
   }
-  res = ncclIbRtrQp(qp->qp, &devBase->gidInfo, qpCold->remQpn, &remDevInfo, fifoTc, resCtx->baseComm->connTc, resCtx->baseComm->connSl);
+  res = ncclIbRtrQp(qp->qp, &devBase->gidInfo, qpCold->remQpn, remDevInfo, localPortMtu, fifoTc, resCtx->baseComm->connTc, resCtx->baseComm->connSl);
   if (res != ncclSuccess) {
     INFO(NCCL_NET, "NET/IB: %s: RTR failed while rejoining QP index %d (qp_num=%u, devIndex=%d, remQpn=%u, comm=%p).",
          __func__, qpIndex, qp->qp->qp_num, qp->devIndex, qpCold->remQpn, resCtx->baseComm);
@@ -1479,8 +1478,7 @@ ncclResult_t ncclIbResiliencySenderQpsToRts(struct ncclIbResiliency* resCtx, str
     // finding the correct remote device information is done by checking the
     // remote QP info.
     ncclIbDevInfo* remDevInfo = &remInfo->devs[remQpInfo->devIndex];
-    remDevInfo->mtu = std::min(remDevInfo->mtu, ibDev->portAttr.active_mtu); // TODO: This is bad practice!
-    NCCLCHECK(ncclIbRtrQp(localQp->qp, &sendCommDev->base.gidInfo, remQpInfo->qpn, remDevInfo, false, remInfo->tc, remInfo->sl));
+    NCCLCHECK(ncclIbRtrQp(localQp->qp, &sendCommDev->base.gidInfo, remQpInfo->qpn, remDevInfo, ibDev->portAttr.active_mtu, false, remInfo->tc, remInfo->sl));
     NCCLCHECK(ncclIbRtsQp(localQp->qp));
   }
   resCtx->remoteReadyStateAddr = remInfo->resiliencyInfo.readyStateAddr;
@@ -1521,7 +1519,7 @@ ncclResult_t ncclIbResiliencyReceiverQpsCreateToRts(struct ncclIbResiliency* res
     ncclIbQpInfo* remQpInfo = &remInfo->resiliencyInfo.probingQpsInfo[localQpIndex];
     ncclIbDevInfo* remDevInfo = &remInfo->devs[remQpInfo->devIndex];
     localQp->remDevIdx = remQpInfo->devIndex;
-    NCCLCHECK(ncclIbRtrQp(localQp->qp, &recvCommDev->base.gidInfo, remQpInfo->qpn, remDevInfo, true, remInfo->tc, remInfo->sl));
+    NCCLCHECK(ncclIbRtrQp(localQp->qp, &recvCommDev->base.gidInfo, remQpInfo->qpn, remDevInfo, ibDev->portAttr.active_mtu, true, remInfo->tc, remInfo->sl));
     NCCLCHECK(ncclIbRtsQp(localQp->qp));
   }
   localResiliencyInfo->readyStateAddr = (uint64_t)&resCtx->localReady;

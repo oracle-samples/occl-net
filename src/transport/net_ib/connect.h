@@ -70,7 +70,7 @@ struct ncclIbConnectionMetadata {
 
 ncclResult_t ibQpToInit(struct ibv_qp* qp, uint8_t ibPort, unsigned int accessFlags);
 ncclResult_t ncclIbCreateQp(struct ncclIbQpCreateAttr* createQpAttrs, void* qp_context, struct ncclIbQp* qp);
-ncclResult_t ncclIbRtrQp(struct ibv_qp* qp, struct ncclIbGidInfo* sGidInfo, uint32_t dest_qp_num, struct ncclIbDevInfo* info, bool fifoTc, int tc, int sl);
+ncclResult_t ncclIbRtrQp(struct ibv_qp* qp, struct ncclIbGidInfo* sGidInfo, uint32_t dest_qp_num, struct ncclIbDevInfo* info, enum ibv_mtu localMtu, bool fifoTc, int tc, int sl);
 ncclResult_t ncclIbRtsQp(struct ibv_qp* qp);
 
 #endif // NET_IB_CONNECT_H_

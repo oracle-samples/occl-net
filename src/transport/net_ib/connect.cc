@@ -371,11 +371,11 @@ ncclResult_t ncclIbCreateQp(struct ncclIbQpCreateAttr* createQpAttrs, void* qp_c
   return ncclSuccess;
 }
 
-ncclResult_t ncclIbRtrQp(struct ibv_qp* qp, struct ncclIbGidInfo* sGidInfo, uint32_t dest_qp_num, struct ncclIbDevInfo* info, bool fifoTc, int tc, int sl) {
+ncclResult_t ncclIbRtrQp(struct ibv_qp* qp, struct ncclIbGidInfo* sGidInfo, uint32_t dest_qp_num, struct ncclIbDevInfo* info, enum ibv_mtu localMtu, bool fifoTc, int tc, int sl) {
   struct ibv_qp_attr qpAttr;
   memset(&qpAttr, 0, sizeof(struct ibv_qp_attr));
   qpAttr.qp_state = IBV_QPS_RTR;
-  qpAttr.path_mtu = info->mtu;
+  qpAttr.path_mtu = std::min(info->mtu, localMtu);
   qpAttr.dest_qp_num = dest_qp_num;
   qpAttr.rq_psn = 0;
   qpAttr.max_dest_rd_atomic = 1;
@@ -554,8 +554,7 @@ static ncclResult_t ncclIbSenderQpsToRts(ncclIbSendComm* comm, struct ncclIbConn
       NCCLCHECK(wrap_ibv_set_ece(localQp->qp, &remQpInfo->ece, &remQpInfo->ece_supported));
     }
 
-    remDevInfo->mtu = std::min(remDevInfo->mtu, ibDev->portAttr.active_mtu); // TODO: This is bad practice!
-    NCCLCHECK(ncclIbRtrQp(localQp->qp, &commDev->base.gidInfo, remQpInfo->qpn, remDevInfo, false, remMeta->tc, remMeta->sl));
+    NCCLCHECK(ncclIbRtrQp(localQp->qp, &commDev->base.gidInfo, remQpInfo->qpn, remDevInfo, ibDev->portAttr.active_mtu, false, remMeta->tc, remMeta->sl));
     NCCLCHECK(ncclIbRtsQp(localQp->qp));
   }
 
@@ -966,10 +965,7 @@ static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
       localQpInfo->ece_supported = 0;
     }
 
-    // Reduce the local MTU to match the remote MTU if needed
-    ibDev->portAttr.active_mtu = std::min(ibDev->portAttr.active_mtu, remDevInfo->mtu);
-
-    NCCLCHECK(ncclIbRtrQp(localQp->qp, &rCommDev->base.gidInfo, remQpInfo->qpn, remDevInfo, true, remMeta->tc, remMeta->sl));
+    NCCLCHECK(ncclIbRtrQp(localQp->qp, &rCommDev->base.gidInfo, remQpInfo->qpn, remDevInfo, ibDev->portAttr.active_mtu, true, remMeta->tc, remMeta->sl));
     NCCLCHECK(ncclIbRtsQp(localQp->qp));
 
     // Query the reduced ECE by the device and storing it in the local QP info
@@ -1011,7 +1007,7 @@ static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
       devInfo.gid.global.subnet_prefix        = rCommDev->base.gidInfo.localGid.global.subnet_prefix;
       devInfo.gid.global.interface_id         = rCommDev->base.gidInfo.localGid.global.interface_id;
       devInfo.mtu         = ibDev->portAttr.active_mtu;
-      NCCLCHECK(ncclIbRtrQp(rCommDev->gpuFlush.qp.qp, &rCommDev->base.gidInfo, rCommDev->gpuFlush.qp.qp->qp_num, &devInfo, false, remMeta->tc, remMeta->sl));
+      NCCLCHECK(ncclIbRtrQp(rCommDev->gpuFlush.qp.qp, &rCommDev->base.gidInfo, rCommDev->gpuFlush.qp.qp->qp_num, &devInfo, ibDev->portAttr.active_mtu, false, remMeta->tc, remMeta->sl));
       NCCLCHECK(ncclIbRtsQp(rCommDev->gpuFlush.qp.qp));
     }
   }

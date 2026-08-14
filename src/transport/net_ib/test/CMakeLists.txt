@@ -42,6 +42,7 @@ if(OCCL_NET_IB_ENABLE_TESTS)
                 GTest::gtest_main
                 Threads::Threads
                 CUDA::cudart
+                ${CMAKE_DL_LIBS}
         )
 
         target_compile_options(${target_name}

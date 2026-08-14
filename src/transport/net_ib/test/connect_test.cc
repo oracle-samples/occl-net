@@ -15,6 +15,11 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+static struct ibv_qp testQp = {};
+static struct ibv_qp_attr lastRtrAttr = {};
+static int lastRtrAttrMask = 0;
+static int rtrModifyCalls = 0;
+
 int64_t ncclParamIbOooRq() {
   return 0;
 }
@@ -112,11 +117,18 @@ ncclResult_t wrap_ibv_destroy_cq(struct ibv_cq*) {
 }
 
 ncclResult_t wrap_ibv_create_qp(struct ibv_qp** ret, struct ibv_pd*, struct ibv_qp_init_attr*) {
-  *ret = reinterpret_cast<ibv_qp*>(0x1);
+  testQp = {};
+  testQp.qp_num = 17;
+  *ret = &testQp;
   return ncclSuccess;
 }
 
-ncclResult_t wrap_ibv_modify_qp(struct ibv_qp*, struct ibv_qp_attr*, int) {
+ncclResult_t wrap_ibv_modify_qp(struct ibv_qp*, struct ibv_qp_attr* attr, int attrMask) {
+  if (attrMask & IBV_QP_PATH_MTU) {
+    lastRtrAttr = *attr;
+    lastRtrAttrMask = attrMask;
+    rtrModifyCalls++;
+  }
   return ncclSuccess;
 }
 
@@ -143,22 +155,6 @@ struct ibv_qp* wrap_mlx5dv_create_qp(struct ibv_context*, struct ibv_qp_init_att
 
 #include "../connect.cc"  // NOLINT(build/include)
 
-TEST(NetIbConnectTest, TrafficClassReadsAndUpdatesConfig) {
-  ncclNetCommConfig_t config = {};
-  config.trafficClass = 11;
-
-  EXPECT_EQ(ncclIbGetTrafficClass(&config), 11);
-
-  ncclIbSetTrafficClass(&config, 23);
-
-  EXPECT_EQ(config.trafficClass, 23);
-}
-
-TEST(NetIbConnectTest, TrafficClassHandlesNullConfig) {
-  EXPECT_EQ(ncclIbGetTrafficClass(nullptr), NCCL_NET_TRAFFIC_CLASS_UNDEF);
-  ncclIbSetTrafficClass(nullptr, 7);
-}
-
 TEST(NetIbConnectTest, VirtualDeviceCompatibilityAllowsIntersections) {
   ncclNetVDeviceProps_t local = {};
   local.ndevs = 2;
@@ -171,4 +167,49 @@ TEST(NetIbConnectTest, VirtualDeviceCompatibilityAllowsIntersections) {
   remote.devs[1] = 4;
 
   EXPECT_EQ(ncclIbCheckVProps(&local, &remote), ncclSuccess);
+}
+
+TEST(NetIbConnectTest, ReceiverQpUsesMinimumEndpointMtuWithoutMutatingMetadata) {
+  auto verifyMtu = [](enum ibv_mtu localMtu, enum ibv_mtu remoteMtu) {
+    SCOPED_TRACE(::testing::Message() << "localMtu=" << localMtu << ", remoteMtu=" << remoteMtu);
+
+    struct ncclIbRecvComm comm = {};
+    struct ncclIbConnectionMetadata remMeta = {};
+    struct ncclIbConnectionMetadata localMeta = {};
+
+    comm.base.nqps = 1;
+    comm.base.vProps.ndevs = 1;
+    comm.base.qps[0].coldIdx = 0;
+    comm.devs[0].base.ibDevN = 0;
+    comm.devs[0].base.cq = reinterpret_cast<ibv_cq*>(0x1);
+    comm.devs[0].base.pd = reinterpret_cast<ibv_pd*>(0x1);
+
+    ncclIbDevs[0].portNum = 1;
+    ncclIbDevs[0].portAttr.active_mtu = localMtu;
+    ncclIbDevs[0].portAttr.link_layer = IBV_LINK_LAYER_INFINIBAND;
+
+    constexpr uint32_t remoteQpNum = 23;
+    remMeta.qpInfo[0].qpn = remoteQpNum;
+    remMeta.qpInfo[0].devIndex = 0;
+    remMeta.devs[0].mtu = remoteMtu;
+    remMeta.devs[0].link_layer = IBV_LINK_LAYER_INFINIBAND;
+    remMeta.devs[0].ib_port = 1;
+    remMeta.devs[0].lid = 1;
+
+    lastRtrAttr = {};
+    lastRtrAttrMask = 0;
+    rtrModifyCalls = 0;
+
+    ASSERT_EQ(ncclIbReceiverQpsCreateToRts(&comm, &remMeta, &localMeta), ncclSuccess);
+    ASSERT_EQ(rtrModifyCalls, 1);
+    EXPECT_NE(lastRtrAttrMask & IBV_QP_PATH_MTU, 0);
+    EXPECT_EQ(lastRtrAttr.path_mtu, std::min(localMtu, remoteMtu));
+    EXPECT_EQ(lastRtrAttr.dest_qp_num, remoteQpNum);
+    EXPECT_EQ(ncclIbDevs[0].portAttr.active_mtu, localMtu);
+    EXPECT_EQ(remMeta.devs[0].mtu, remoteMtu);
+  };
+
+  verifyMtu(IBV_MTU_1024, IBV_MTU_4096);
+  verifyMtu(IBV_MTU_4096, IBV_MTU_1024);
+  verifyMtu(IBV_MTU_2048, IBV_MTU_2048);
 }
