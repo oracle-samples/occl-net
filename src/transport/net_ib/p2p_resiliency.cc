@@ -1,8 +1,15 @@
 /*************************************************************************
+ * Copyright (c) 2026 Oracle and/or its affiliates.
+ * Modifications by Oracle and/or its affiliates are licensed under the
+ * Universal Permissive License (UPL), Version 1.0. See LICENSE.txt.
+ * Modified by Oracle and/or its affiliates on 2026-03-06.
+ *************************************************************************/
+
+/*************************************************************************
  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/Apache-2.0.txt for more license information
  *************************************************************************/
 
 #include "p2p_resiliency.h"
@@ -56,12 +63,56 @@ static inline void ncclIbResiliencyResetPeerReadyReadState(struct ncclIbResilien
   resCtx->peerReadyReadDevIndex = -1;
 }
 
+static inline bool ibResiliencyProbeQpUsable(const struct ncclIbResiliency* resCtx, int probingQpIndex) {
+  if (probingQpIndex < 0 || probingQpIndex >= resCtx->nProbingQps) return false;
+  if ((resCtx->failedProbeQpMask & (1ULL << probingQpIndex)) != 0) return false;
+  const struct ncclIbQp* qp = &resCtx->probingQps[probingQpIndex];
+  return qp->qp != NULL && qp->devIndex >= 0 && qp->devIndex < resCtx->ndevs &&
+         resCtx->devs[qp->devIndex].state == ncclIbResiliencyDevStateOk &&
+         qp->remDevIdx >= 0 && qp->remDevIdx < resCtx->baseComm->nRemDevs;
+}
+
+static int ibResiliencyProbeQpIndexFromCompletion(const struct ncclIbResiliency* resCtx, int devIndex, uint32_t qpNum) {
+  for (int probingQpIndex = 0; probingQpIndex < resCtx->nProbingQps; probingQpIndex++) {
+    const struct ncclIbQp* qp = &resCtx->probingQps[probingQpIndex];
+    if (qp->qp != NULL && qp->devIndex == devIndex && qp->qp->qp_num == qpNum) return probingQpIndex;
+  }
+  return -1;
+}
+
 static inline void ibResiliencyRefreshFrmQpHealth(struct ncclIbResiliency* resCtx) {
   assert(resCtx != NULL);
-  int nqps = (resCtx->baseComm != NULL && resCtx->baseComm->nqps > 0) ? resCtx->baseComm->nqps : 0;
+  struct ncclIbNetCommBase* base = resCtx->baseComm;
+  int nqps = (base != NULL && base->nqps > 0) ? base->nqps : 0;
+
+  // Direct geometry keeps the historical FRM gate: health follows the
+  // original QP slots even while legacy failover temporarily borrows another
+  // slot's QP. Standby geometry instead follows the physical QP currently
+  // carrying each stable logical lane.
+  if (base == NULL || !base->hasStandbyPaths) {
+    bool allOk = true;
+    for (int qpIndex = 0; qpIndex < nqps; qpIndex++) {
+      if (resCtx->qpInfo[qpIndex].state != ncclIbResiliencyQpStateOk) {
+        allOk = false;
+        break;
+      }
+    }
+    resCtx->frmAllQpsHealthy = allOk;
+    return;
+  }
+
+  int physicalQps = base != NULL ? occlIbCommPhysicalQpCount(base) : 0;
   bool allOk = true;
-  for (int qpIndex = 0; qpIndex < nqps; qpIndex++) {
-    if (resCtx->qpInfo[qpIndex].state != ncclIbResiliencyQpStateOk) {
+  for (int logicalLane = 0; logicalLane < nqps; logicalLane++) {
+    struct ncclIbQp* activeQp = base->activeQps[logicalLane];
+    if (activeQp == NULL) {
+      allOk = false;
+      break;
+    }
+    int physicalQpIndex = activeQp - base->qps;
+    if (physicalQpIndex < 0 || physicalQpIndex >= physicalQps ||
+        activeQp->logicalLane != logicalLane ||
+        resCtx->qpInfo[physicalQpIndex].state != ncclIbResiliencyQpStateOk) {
       allOk = false;
       break;
     }
@@ -110,41 +161,47 @@ static ncclResult_t ncclIbResiliencyReplaceQps(struct ncclIbResiliency* resCtx, 
   // Iterate over all active QPs and replace the ones that are associated with
   // the failed device
   struct ncclIbQp** activeQps = resCtx->baseComm->activeQps;
-  for (int qpIndex = 0; qpIndex < resCtx->baseComm->nqps; qpIndex++) {
-    struct ncclIbQp* failedQp = activeQps[qpIndex];
+  struct ncclIbNetCommBase* base = resCtx->baseComm;
+  int physicalQps = occlIbCommPhysicalQpCount(base);
+  assert(base->nqps > 0 && physicalQps % base->nqps == 0);
+  int nPaths = physicalQps / base->nqps;
+  const bool hasStandbyPaths = base->hasStandbyPaths;
+  assert(hasStandbyPaths == (physicalQps > base->nqps));
+  for (int logicalLane = 0; logicalLane < base->nqps; logicalLane++) {
+    struct ncclIbQp* failedQp = activeQps[logicalLane];
     if (failedQp->devIndex != failedDevIndex) {
       // This is not a failed QP
       continue;
     }
     // Find the failed QP's index in the baseComm.qps[] array
-    int failedQpIndex = failedQp - resCtx->baseComm->qps;
-    assert(failedQpIndex >= 0 && failedQpIndex < resCtx->baseComm->nqps);
+    int failedQpIndex = failedQp - base->qps;
+    assert(failedQpIndex >= 0 && failedQpIndex < physicalQps);
+    assert(!hasStandbyPaths || failedQp->logicalLane == logicalLane);
 
-    // After finding a failed QP, iterate over the QPs to find a replacement QP
-    // that is not associated with a failed device.
+    // Standby geometry searches only this logical lane's preconnected paths;
+    // legacy striped geometry has no private paths and keeps its historical
+    // cross-QP replacement order.
     bool replaced = false;
-    int newQpIndex = -1;
-    int newDevIndex = -1;
-    int offset = 1;
-    enum ncclIbResiliencyDevState newDevState = ncclIbResiliencyDevStateError;
-    do {
-      newQpIndex = (failedQpIndex + offset) % resCtx->baseComm->nqps;
-
-      // Check if the new QP is on a functional device
-      newDevIndex = resCtx->baseComm->qps[newQpIndex].devIndex;
-      newDevState = resCtx->devs[newDevIndex].state;
+    int candidateCount = hasStandbyPaths ? nPaths : physicalQps;
+    for (int candidate = 0; candidate < candidateCount; candidate++) {
+      int newQpIndex = hasStandbyPaths
+          ? occlIbCommPhysicalQpIndex(base, logicalLane, candidate)
+          : (failedQpIndex + candidate + 1) % physicalQps;
+      struct ncclIbQp* newQp = &base->qps[newQpIndex];
+      if (hasStandbyPaths) assert(newQp->logicalLane == logicalLane);
+      int newDevIndex = newQp->devIndex;
+      enum ncclIbResiliencyDevState newDevState = resCtx->devs[newDevIndex].state;
       enum ncclIbResiliencyQpState newQpState = resCtx->qpInfo[newQpIndex].state;
       if (newDevState != ncclIbResiliencyDevStateOk || !ncclIbResiliencyQpIsTrafficReady(newQpState)) {
-        offset++;
         WARN("NET/IB: %s: Cannot replace QP with qpIndex=%d because the candidate QP (qpIndex=%d, devIndex=%d, devState=%d, qpState=%d) is not traffic-ready", __func__, failedQpIndex, newQpIndex, newDevIndex, newDevState, newQpState);
         continue;
       }
 
-      INFO(NCCL_NET, "NET/IB: %s: Replacing QP: qpIndex=%d (qp_num=%u, devIndex=%d) to qpIndex=%d (qp_num=%u, devIndex=%d) on %s communicator (comm=%p)", __func__, failedQpIndex, resCtx->baseComm->qps[failedQpIndex].qp->qp_num, resCtx->baseComm->qps[failedQpIndex].devIndex, newQpIndex, resCtx->baseComm->qps[newQpIndex].qp->qp_num, resCtx->baseComm->qps[newQpIndex].devIndex, resCtx->baseComm->isSend ? "send" : "recv", resCtx->baseComm);
-      activeQps[qpIndex] = &resCtx->baseComm->qps[newQpIndex];
+      INFO(NCCL_NET, "NET/IB: %s: Replacing logical lane %d QP: qpIndex=%d (qp_num=%u, devIndex=%d) to qpIndex=%d (qp_num=%u, devIndex=%d) on %s communicator (comm=%p)", __func__, logicalLane, failedQpIndex, base->qps[failedQpIndex].qp->qp_num, base->qps[failedQpIndex].devIndex, newQpIndex, newQp->qp->qp_num, newQp->devIndex, base->isSend ? "send" : "recv", base);
+      activeQps[logicalLane] = newQp;
       replaced = true;
-
-    } while (replaced == false && newQpIndex != failedQpIndex);
+      break;
+    }
 
     if (!replaced) {
       WARN("NET/IB: %s: Could not find a replacement QP for the failed QP with qpIndex=%d (devIndex=%d)", __func__, failedQpIndex, failedQp->devIndex);
@@ -158,7 +215,7 @@ static ncclResult_t ncclIbResiliencyReplaceQps(struct ncclIbResiliency* resCtx, 
 // Returns true if at least one QP on this communicator is currently marked
 // failed and still waiting to rejoin.
 static inline bool ncclIbResiliencyHasPendingQpRecovery(struct ncclIbResiliency* resCtx) {
-  for (int qpIndex = 0; qpIndex < resCtx->baseComm->nqps; qpIndex++) {
+  for (int qpIndex = 0; qpIndex < occlIbCommPhysicalQpCount(resCtx->baseComm); qpIndex++) {
     enum ncclIbResiliencyQpState state = resCtx->qpInfo[qpIndex].state;
     if (ncclIbResiliencyQpIsPendingRecovery(state)) return true;
   }
@@ -233,7 +290,7 @@ static ncclResult_t ncclIbResiliencyQpToReset(struct ibv_qp* qp) {
 static ncclResult_t ncclIbResiliencyMarkQpRejoinFailure(struct ncclIbResiliency* resCtx, int qpIndex, const char* stage) {
   assert(resCtx != NULL);
   assert(stage != NULL);
-  assert(qpIndex >= 0 && qpIndex < resCtx->baseComm->nqps);
+  assert(qpIndex >= 0 && qpIndex < occlIbCommPhysicalQpCount(resCtx->baseComm));
   struct ncclIbResiliencyQpInfo* qpInfo = &resCtx->qpInfo[qpIndex];
   struct ncclIbQp* qp = &resCtx->baseComm->qps[qpIndex];
 
@@ -269,6 +326,18 @@ static ncclResult_t ncclIbResiliencyHandlePeerReadyReadFailure(struct ncclIbResi
 
   struct ncclIbResiliencyDev* resDev = &resCtx->devs[devIndex];
   int probingQpIndex = resCtx->peerReadyReadQpIndex;
+  if (wc != NULL) {
+    int completedQpIndex = ibResiliencyProbeQpIndexFromCompletion(resCtx, devIndex, wc->qp_num);
+    if (completedQpIndex < 0) {
+      WARN("NET/IB: %s: Could not identify failed peer-ready probing QP (devIndex=%d, qp_num=%u, comm=%p).", __func__, devIndex, wc->qp_num, resCtx->baseComm);
+      return ncclInternalError;
+    }
+    resCtx->failedProbeQpMask |= 1ULL << completedQpIndex;
+    if (!resCtx->peerReadyReadInFlight || completedQpIndex != probingQpIndex || resCtx->peerReadyReadDevIndex != devIndex) {
+      WARN("NET/IB: %s: Quarantined stale failed peer-ready probing QP index %d (devIndex=%d, qp_num=%u, comm=%p) without disturbing the current read.", __func__, completedQpIndex, devIndex, wc->qp_num, resCtx->baseComm);
+      return ncclSuccess;
+    }
+  }
   uint64_t retryAfterNs = clockNano() + ncclIbResiliencyPeerReadyBackoffNs(resDev->peerReadyFailureCount + 1);
 
   ncclIbResiliencyResetPeerReadyReadState(resCtx);
@@ -278,7 +347,7 @@ static ncclResult_t ncclIbResiliencyHandlePeerReadyReadFailure(struct ncclIbResi
   resDev->peerReadyRetryAfterNs = retryAfterNs;
 
   if (wc != NULL) {
-    WARN("NET/IB: %s: Peer-ready read %s on devIndex=%d (probingQpIndex=%d, status=%s(%d), wr_id=%ld, qp_num=%u, failCount=%d). Scoping this to peer-ready backoff until %llu ns instead of failing the data device (comm=%p).",
+    WARN("NET/IB: %s: Peer-ready read %s on devIndex=%d (probingQpIndex=%d, status=%s(%d), wr_id=%ld, qp_num=%u, failCount=%d). Quarantining this probing QP and keeping the data device active; retry backoff lasts until %llu ns (comm=%p).",
          __func__, reason, devIndex, probingQpIndex, ibvWcStatusStr(wc->status), wc->status, wc->wr_id, wc->qp_num, resDev->peerReadyFailureCount,
          (unsigned long long)retryAfterNs, resCtx->baseComm);
   } else {
@@ -306,11 +375,12 @@ static inline bool ncclIbResiliencySendRequestRecoveryActive(enum ncclIbResilien
 
 static ncclResult_t ncclIbResiliencyReconcileDeviceStates(struct ncclIbResiliency* resCtx) {
   assert(resCtx != NULL);
+  int physicalQps = occlIbCommPhysicalQpCount(resCtx->baseComm);
   for (int devIndex = 0; devIndex < resCtx->ndevs; devIndex++) {
     int nTrafficReadyQps = 0;
     int nPendingQps = 0;
     int nPermanentFailedQps = 0;
-    for (int qpIndex = 0; qpIndex < resCtx->baseComm->nqps; qpIndex++) {
+    for (int qpIndex = 0; qpIndex < physicalQps; qpIndex++) {
       if (resCtx->baseComm->qps[qpIndex].devIndex != devIndex) continue;
       switch (resCtx->qpInfo[qpIndex].state) {
         case ncclIbResiliencyQpStateOk:
@@ -413,7 +483,7 @@ static ncclResult_t ncclIbResiliencyPeerReadyReadPost(struct ncclIbResiliency* r
   if (resCtx->remoteReadyStateAddr == 0) return ncclSuccess;
   if (resCtx->nProbingQps == 0) return ncclSuccess;
   bool needPeerReadyRead = false;
-  for (int qpIndex = 0; qpIndex < resCtx->baseComm->nqps; qpIndex++) {
+  for (int qpIndex = 0; qpIndex < occlIbCommPhysicalQpCount(resCtx->baseComm); qpIndex++) {
     if (resCtx->qpInfo[qpIndex].state == ncclIbResiliencyQpStateLocalReady) {
       needPeerReadyRead = true;
       break;
@@ -435,15 +505,12 @@ static ncclResult_t ncclIbResiliencyPeerReadyReadPost(struct ncclIbResiliency* r
   uint32_t remoteRkey = 0;
   for (int offset = 0; offset < resCtx->nProbingQps; offset++) {
     int candidateQpIndex = (resCtx->nextPeerReadyQpIndex + offset) % resCtx->nProbingQps;
+    if (!ibResiliencyProbeQpUsable(resCtx, candidateQpIndex)) continue;
     struct ncclIbQp* qp = &resCtx->probingQps[candidateQpIndex];
-    if (qp->qp == NULL) continue;
-    if (qp->devIndex < 0 || qp->devIndex >= resCtx->ndevs) continue;
     // Keep the peer-ready control read on the known-good failover path. Using a
     // probing QP on a device that is itself still recovering can stall the
     // handshake even though replay traffic is already succeeding elsewhere.
-    if (resCtx->devs[qp->devIndex].state != ncclIbResiliencyDevStateOk) continue;
     if (resCtx->devs[qp->devIndex].peerReadyRetryAfterNs > now) continue;
-    if (qp->remDevIdx < 0 || qp->remDevIdx >= resCtx->baseComm->nRemDevs) continue;
     if (resCtx->remoteReadyStateRkeys[qp->remDevIdx] == 0) continue;
     probingQpIndex = candidateQpIndex;
     devIndex = qp->devIndex;
@@ -493,7 +560,8 @@ static ncclResult_t ncclIbResiliencyPeerReadyReadPost(struct ncclIbResiliency* r
 static ncclResult_t ncclIbResiliencyTryActivatePeerReadyQps(struct ncclIbResiliency* resCtx) {
   assert(resCtx != NULL);
   bool refreshedAnyQp = false;
-  for (int qpIndex = 0; qpIndex < resCtx->baseComm->nqps; qpIndex++) {
+  struct ncclIbNetCommBase* base = resCtx->baseComm;
+  for (int qpIndex = 0; qpIndex < occlIbCommPhysicalQpCount(base); qpIndex++) {
     struct ncclIbResiliencyQpInfo* qpInfo = &resCtx->qpInfo[qpIndex];
     if (qpInfo->state != ncclIbResiliencyQpStateLocalReady) continue;
     if (!ncclIbResiliencyReadyQpGetBit(resCtx->localReady.mask, qpIndex)) continue;
@@ -501,15 +569,22 @@ static ncclResult_t ncclIbResiliencyTryActivatePeerReadyQps(struct ncclIbResilie
     uint32_t remoteEpoch = resCtx->remoteReady.epoch[qpIndex];
     if (remoteEpoch == 0 || remoteEpoch == resCtx->activatedRemoteReadyEpoch[qpIndex]) continue;
 
-    resCtx->baseComm->activeQps[qpIndex] = &resCtx->baseComm->qps[qpIndex];
+    struct ncclIbQp* qp = &base->qps[qpIndex];
+    int logicalLane = base->hasStandbyPaths ? qp->logicalLane : qpIndex;
+    if (logicalLane < 0 || logicalLane >= base->nqps) {
+      WARN("NET/IB: %s: Invalid logical lane %d on peer-ready QP index %d (comm=%p).", __func__, logicalLane, qpIndex, base);
+      return ncclInternalError;
+    }
+    bool isPrimary = !base->hasStandbyPaths || qpIndex == occlIbCommPhysicalQpIndex(base, logicalLane, 0);
+    if (isPrimary) base->activeQps[logicalLane] = qp;
     qpInfo->state = ncclIbResiliencyQpStateOk;
     qpInfo->failCount = 0;
     qpInfo->lastAttemptNs = 0;
     qpInfo->localPortRetryLogged = false;
     resCtx->activatedRemoteReadyEpoch[qpIndex] = remoteEpoch;
     refreshedAnyQp = true;
-    INFO(NCCL_NET, "NET/IB: %s: Activated peer-ready QP index %d (qp_num=%u, devIndex=%d, remoteReadyEpoch=%u, comm=%p).",
-         __func__, qpIndex, resCtx->baseComm->qps[qpIndex].qp->qp_num, resCtx->baseComm->qps[qpIndex].devIndex, remoteEpoch, resCtx->baseComm);
+    INFO(NCCL_NET, "NET/IB: %s: Activated peer-ready QP index %d (logicalLane=%d, qp_num=%u, devIndex=%d, remoteReadyEpoch=%u, primaryFailback=%d, comm=%p).",
+         __func__, qpIndex, logicalLane, qp->qp->qp_num, qp->devIndex, remoteEpoch, isPrimary, base);
   }
   if (refreshedAnyQp) ibResiliencyRefreshFrmQpHealth(resCtx);
   return ncclSuccess;
@@ -520,7 +595,7 @@ static ncclResult_t ncclIbResiliencyTryActivatePeerReadyQps(struct ncclIbResilie
 // RESET -> INIT -> ECE -> RTR -> RTS, then publish local-ready for peer synchronization.
 static ncclResult_t ncclIbResiliencyTryRejoinSingleQp(struct ncclIbResiliency* resCtx, int qpIndex) {
   assert(resCtx != NULL);
-  assert(qpIndex >= 0 && qpIndex < resCtx->baseComm->nqps);
+  assert(qpIndex >= 0 && qpIndex < occlIbCommPhysicalQpCount(resCtx->baseComm));
 
   struct ncclIbResiliencyQpInfo* qpInfo = &resCtx->qpInfo[qpIndex];
   struct ncclIbQp* qp = &resCtx->baseComm->qps[qpIndex];
@@ -730,7 +805,7 @@ static ncclResult_t ncclIbResiliencyRepostRequest(struct ncclIbRequest* request)
           }
 
           int physicalQpIndex = qp - sendReqs[r]->base->qps;
-          assert(physicalQpIndex >= 0 && physicalQpIndex < sendReqs[r]->base->nqps);
+          assert(physicalQpIndex >= 0 && physicalQpIndex < occlIbCommPhysicalQpCount(sendReqs[r]->base));
           TRACE(NCCL_NET, "NET/IB: %s: Retransmitting reqIndex=%d on qp_num=%u for logical QP index %d via physical QP index %d (req=%p, comm=%p, id=%ld, slot=%d) as it was not delivered.", __func__, r, qp->qp->qp_num, qpIndex, physicalQpIndex, sendReqs[r], sendReqs[r]->base, sendReqs[r]->id, slot);
           ncclIbAddEvent(sendReqs[r], qp->devIndex);
         }
@@ -937,7 +1012,7 @@ static ncclResult_t ncclIbResiliencyHandleDeviceFailure(struct ncclIbResiliency*
     resCtx->devs[devIndex].state = ncclIbResiliencyDevStateError;
   }
   NCCLCHECK(ncclIbResiliencyReplaceQps(resCtx, devIndex));
-  for (int qpIndex = 0; qpIndex < resCtx->baseComm->nqps; qpIndex++) {
+  for (int qpIndex = 0; qpIndex < occlIbCommPhysicalQpCount(resCtx->baseComm); qpIndex++) {
     if (resCtx->baseComm->qps[qpIndex].devIndex == devIndex) {
       NCCLCHECK(ncclIbResiliencyMarkQpFailed(resCtx, qpIndex));
     }
@@ -960,7 +1035,8 @@ static ncclResult_t ncclIbResiliencyHandleProbeCompleted(struct ncclIbResiliency
   struct ncclIbRequest** sendReqs = sendComm->sendReqs[slot];
   uint16_t newlyCreditable[NCCL_IB_MAX_QPS] = {0};
   bool missingData = false;
-  for (int qpIndex = 0; qpIndex < failedRequest->request->base->nqps; qpIndex++) {
+  int physicalQps = occlIbCommPhysicalQpCount(failedRequest->request->base);
+  for (int qpIndex = 0; qpIndex < physicalQps; qpIndex++) {
     uint16_t observedCompletions = sendResCtx->probingResults[slot][qpIndex];
     uint16_t creditedCompletions = failedRequest->request->send.ackedCompletions[qpIndex];
     if (observedCompletions > creditedCompletions) {
@@ -971,7 +1047,7 @@ static ncclResult_t ncclIbResiliencyHandleProbeCompleted(struct ncclIbResiliency
     }
   }
 
-  for (int physicalQpIndex = 0; physicalQpIndex < failedRequest->request->base->nqps; physicalQpIndex++) {
+  for (int physicalQpIndex = 0; physicalQpIndex < physicalQps; physicalQpIndex++) {
     while (newlyCreditable[physicalQpIndex] > 0) {
       int deliveredLogicalQpIndex = -1;
       int bestOrder = failedRequest->request->base->nqps + 1;
@@ -1046,22 +1122,22 @@ static ncclResult_t ncclIbResiliencyProbePost(struct ncclIbResiliencySend* sendR
 
   TRACE(NCCL_NET, "NET/IB: %s: Probe delay elapsed (%llu ms) for request %p, posting the probe", __func__, elapsedTime / MSEC_TO_NSEC, failedSendRequest->request);
 
-  int devIndex = 0;
-  for (devIndex = 0; devIndex < sendResCtx->base.ndevs; devIndex++) {
-    if (sendResCtx->base.devs[devIndex].state == ncclIbResiliencyDevStateOk) {
-      // This device is functional. Use it to post the probe.
-      break;
-    }
-  }
-
-  if (devIndex == sendResCtx->base.ndevs) {
-    WARN("NET/IB: %s: Could not find a functional device to post the probe for request %p (id=%ld)", __func__, failedSendRequest->request, failedSendRequest->request->id);
-    return ncclInternalError;
-  }
-
   struct ncclIbResiliency* resCtx = &sendResCtx->base;
+  int probingQpIndex = -1;
+  for (int candidateQpIndex = 0; candidateQpIndex < resCtx->nProbingQps; candidateQpIndex++) {
+    if (!ibResiliencyProbeQpUsable(resCtx, candidateQpIndex)) continue;
+    probingQpIndex = candidateQpIndex;
+    break;
+  }
+
+  if (probingQpIndex < 0) {
+    WARN("NET/IB: %s: No usable auxiliary probing QP remains for request %p (id=%ld).", __func__, failedSendRequest->request, failedSendRequest->request->id);
+    return ncclRemoteError;
+  }
+
+  struct ncclIbQp* probingQp = &resCtx->probingQps[probingQpIndex];
+  int devIndex = probingQp->devIndex;
   struct ncclIbResiliencyDev* resDev = &resCtx->devs[devIndex];
-  struct ncclIbQp* probingQp = &resCtx->probingQps[devIndex];
 
   struct ibv_send_wr probeWr = {0};
   struct ibv_sge sge = {0};
@@ -1097,13 +1173,23 @@ static ncclResult_t ncclIbResiliencyProbePost(struct ncclIbResiliencySend* sendR
   failedSendRequest->state = ncclIbResiliencyRequestStateProbePosted;
   failedSendRequest->probeWrId = probeWr.wr_id;
   resDev->nOutstandingProbes++;
-  assert(resDev->nOutstandingProbes <= NET_IB_MAX_REQUESTS);
+  assert(resDev->nOutstandingProbes <= NET_IB_MAX_REQUESTS + 1);
   return ncclSuccess;
 }
 
 static ncclResult_t ncclIbResiliencyProbeHandleCompletionEvent(struct ncclIbResiliencySend* sendResCtx, struct ibv_wc* probeWc, int devIndex) {
 
   TRACE(NCCL_NET, "NET/IB: %s: Got probing completion (devIndex=%d, wc->status=%d, wc->opcode=%d, wc->wr_id=%ld, wc->qp_num=%u)", __func__, devIndex, probeWc->status, probeWc->opcode, probeWc->wr_id, probeWc->qp_num);
+
+  int completedQpIndex = -1;
+  if (probeWc->status != IBV_WC_SUCCESS) {
+    completedQpIndex = ibResiliencyProbeQpIndexFromCompletion(&sendResCtx->base, devIndex, probeWc->qp_num);
+    if (completedQpIndex < 0) {
+      WARN("NET/IB: %s: Could not identify failed probing QP (devIndex=%d, qp_num=%u, comm=%p).", __func__, devIndex, probeWc->qp_num, sendResCtx->base.baseComm);
+      return ncclInternalError;
+    }
+    sendResCtx->base.failedProbeQpMask |= 1ULL << completedQpIndex;
+  }
 
   int failedSlot = (int)ibResiliencyProbeWrIdDecodeSlot(probeWc->wr_id);
   struct ncclIbResiliencyRequestSend* failedRequest = &sendResCtx->failedRequests[failedSlot];
@@ -1121,15 +1207,16 @@ static ncclResult_t ncclIbResiliencyProbeHandleCompletionEvent(struct ncclIbResi
     return ncclSuccess;
   }
 
-  NCCLCHECK(ncclIbResiliencyCheckErrorNotFatal(&sendResCtx->base, probeWc, devIndex));
-
-  NCCLCHECK(ncclIbResiliencyHandleDeviceFailure(&sendResCtx->base, devIndex));
+  if (probeWc->status != IBV_WC_WR_FLUSH_ERR && probeWc->status != IBV_WC_RETRY_EXC_ERR) {
+    WARN("NET/IB: %s: Fatal auxiliary probing completion status %s (%d) on probingQpIndex=%d.", __func__, ibvWcStatusStr(probeWc->status), probeWc->status, completedQpIndex);
+    return ncclRemoteError;
+  }
 
   // The probe will reposted upon the next call to progress resiliency
   failedRequest->state = ncclIbResiliencyRequestStatePending;
   failedRequest->failedAttempts++;
-  INFO(NCCL_NET, "NET/IB: %s: Probe attempt failed for slot=%d (req=%p, comm=%p, id=%ld). Reverting to pending state for another attempt.",
-       __func__, failedSlot, failedRequest->request, failedRequest->request->base, failedRequest->request->id);
+  WARN("NET/IB: %s: Quarantined failed auxiliary probing QP index %d for slot=%d (req=%p, comm=%p, id=%ld). Retrying without changing data-device state.",
+       __func__, completedQpIndex, failedSlot, failedRequest->request, failedRequest->request->base, failedRequest->request->id);
   return ncclSuccess;
 }
 
@@ -1203,6 +1290,7 @@ ncclResult_t ncclIbResiliencyInit(struct ncclIbNetCommBase* baseComm, struct ncc
   memset(&baseCtx->remoteReady, 0, sizeof(baseCtx->remoteReady));
   memset(baseCtx->activatedRemoteReadyEpoch, 0, sizeof(baseCtx->activatedRemoteReadyEpoch));
   memset(baseCtx->remoteReadyStateRkeys, 0, sizeof(baseCtx->remoteReadyStateRkeys));
+  baseCtx->failedProbeQpMask = 0;
   baseCtx->remoteReadyStateAddr = 0;
   ncclIbResiliencyResetPeerReadyReadState(baseCtx);
   baseCtx->nextPeerReadyQpIndex = 0;
@@ -1251,7 +1339,7 @@ ncclResult_t ncclIbResiliencySendRequestComplete(struct ncclIbResiliency* resCtx
 
 ncclResult_t ncclIbResiliencyMarkQpFailed(struct ncclIbResiliency* resCtx, int qpIndex) {
   assert(resCtx != NULL);
-  if (qpIndex < 0 || qpIndex >= resCtx->baseComm->nqps) {
+  if (qpIndex < 0 || qpIndex >= occlIbCommPhysicalQpCount(resCtx->baseComm)) {
     WARN("NET/IB: %s: Invalid QP index %d for comm=%p.", __func__, qpIndex, resCtx->baseComm);
     return ncclInternalError;
   }
@@ -1275,7 +1363,7 @@ ncclResult_t ncclIbResiliencyMarkQpFailed(struct ncclIbResiliency* resCtx, int q
 ncclResult_t ncclIbResiliencyTryRejoinQps(struct ncclIbResiliency* resCtx) {
   assert(resCtx != NULL);
 
-  for (int qpIndex = 0; qpIndex < resCtx->baseComm->nqps; qpIndex++) {
+  for (int qpIndex = 0; qpIndex < occlIbCommPhysicalQpCount(resCtx->baseComm); qpIndex++) {
     struct ncclIbResiliencyQpInfo* qpInfo = &resCtx->qpInfo[qpIndex];
     if (qpInfo->state != ncclIbResiliencyQpStateFailed) continue;
 
@@ -1322,7 +1410,7 @@ ncclResult_t ncclIbResiliencyDevInit(struct ncclIbResiliency* resCtx, uint devIn
   NCCLCHECK(wrap_ibv_reg_mr(&resDev->peerReadyStateMr, devBase->pd, &resCtx->remoteReady, sizeof(resCtx->remoteReady), IBV_ACCESS_LOCAL_WRITE));
   int cqSize = -1;
   if (resCtx->baseComm->isSend) {
-    cqSize = NET_IB_MAX_REQUESTS;
+    cqSize = NET_IB_MAX_REQUESTS + 1;
     struct ncclIbResiliencySend* sendResCtx = (struct ncclIbResiliencySend*)resCtx;
     NCCLCHECK(wrap_ibv_reg_mr(&resDev->probingResultMr, devBase->pd, &sendResCtx->probingResults, sizeof(sendResCtx->probingResults), IBV_ACCESS_LOCAL_WRITE));
     INFO(NCCL_NET, "NET/IB: %s: Registered probing results memory (%p) on device %d for resiliency context (comm=%p)", __func__, &sendResCtx->probingResults, devIndex, resCtx->baseComm);
@@ -1402,21 +1490,15 @@ ncclResult_t ncclIbResiliencyDeviceNumSet(struct ncclIbResiliency* resCtx, int n
   INFO(NCCL_NET, "NET/IB: %s: Resiliency context (comm=%p) is configured with %d local devices and %d remote devices", __func__, resCtx->baseComm, nLocalDevs, nRemDevs);
 
   resCtx->ndevs = nLocalDevs;
-  if (resCtx->baseComm->isSend) {
-    // On the sender side, the number of probing QPs will be the number of the
-    // local devices. The reason for that is that sender should be able to
-    // probe on all its devices.
-    resCtx->nProbingQps = nLocalDevs;
+  if (resCtx->baseComm->hasStandbyPaths) {
+    // Standby peers materialize the same control-path width so asymmetric
+    // private groups retain a probe path for every candidate on the wider side.
+    resCtx->nProbingQps = std::max(nLocalDevs, nRemDevs);
   } else {
-    // On the receiver side, the number of probing QPs should match the number
-    // of QPs created on the sender side. So every QP on the sender side is
-    // connected to a QP on the receiver side. If the number of devices on the
-    // receiver side is less than the number of devices on the sender side,
-    // some devices on the receiver side will have more than one probing QP.
-    // If the number of devices on the receiver side is more than the number
-    // of devices on the sender side, some devices on the receiver side will not
-    // have any probing QPs since the sender will not probe on these devices.
-    resCtx->nProbingQps = nRemDevs;
+    // Direct geometry retains the historical endpoint-owned probe geometry:
+    // the sender probes every local device and the receiver mirrors the
+    // sender's device count.
+    resCtx->nProbingQps = resCtx->baseComm->isSend ? nLocalDevs : nRemDevs;
   }
   // In any case, the number of probing QPs cannot exceed the maximum number
   // of devices supported.
@@ -1437,11 +1519,12 @@ ncclResult_t ncclIbResiliencySenderCreateQps(struct ncclIbResiliency* resCtx, st
   // QPs must also accept inbound remote reads.
   qpCreateAttrs.accessFlags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ;
   qpCreateAttrs.maxRecvWorkRequest = 0;
-  // Every send request can initiate at most one probing request.
-  qpCreateAttrs.maxSendWorkRequest = NET_IB_MAX_REQUESTS;
+  // Every send request can initiate one probe alongside peer-ready progress.
+  qpCreateAttrs.maxSendWorkRequest = NET_IB_MAX_REQUESTS + 1;
   for (int localQpIndex = 0; localQpIndex < resCtx->nProbingQps; localQpIndex++) {
-    // Sender creates a single probing QP per local device.
-    int localDevIndex = localQpIndex;
+    int localDevIndex = sendComm->base.hasStandbyPaths
+        ? localQpIndex % sendComm->base.vProps.ndevs
+        : localQpIndex;
     ncclIbSendCommDev* sendCommDev = &sendComm->devs[localDevIndex];
     ncclIbDev* ibDev = &ncclIbDevs[sendCommDev->base.ibDevN];
     ncclIbQp* localQp = &resCtx->probingQps[localQpIndex];
@@ -1468,7 +1551,9 @@ ncclResult_t ncclIbResiliencySenderQpsToRts(struct ncclIbResiliency* resCtx, str
   ncclIbQp* localQp = NULL;
   ncclIbQpInfo* remQpInfo = NULL;
   for (int localQpIndex = 0; localQpIndex < resCtx->nProbingQps; localQpIndex++) {
-    int localDevIndex = localQpIndex;
+    int localDevIndex = sendComm->base.hasStandbyPaths
+        ? localQpIndex % sendComm->base.vProps.ndevs
+        : localQpIndex;
     ncclIbSendCommDev* sendCommDev = &sendComm->devs[localDevIndex];
     ncclIbDev* ibDev = &ncclIbDevs[sendCommDev->base.ibDevN];
     localQp = &resCtx->probingQps[localQpIndex];
@@ -1551,7 +1636,12 @@ ncclResult_t ncclIbResiliencyClose(struct ncclIbResiliency* resCtx) {
 ncclResult_t ncclIbResiliencyRemoteCompletionRecordsSet(struct ncclIbResiliency* resCtx, uint32_t cmplsRecordsRkey, uint64_t cmplsRecordsAddr, uint devIndex) {
   assert(resCtx != NULL);
   assert(resCtx->baseComm->isSend);
-  assert(devIndex <= resCtx->nProbingQps);
+  const int remoteDevices = resCtx->baseComm->nRemDevs;
+  if (remoteDevices <= 0 || devIndex >= (uint)remoteDevices || devIndex >= NCCL_IB_MAX_DEVS_PER_NIC) {
+    WARN("NET/IB: %s: Invalid remote device index %u for communicator with %d remote devices (comm=%p).",
+         __func__, devIndex, remoteDevices, resCtx->baseComm);
+    return ncclInvalidArgument;
+  }
   struct ncclIbResiliencySend* sendResCtx = (struct ncclIbResiliencySend*)resCtx;
   sendResCtx->remCmplRecordsInfo[devIndex].rkey = cmplsRecordsRkey;
   sendResCtx->remCmplRecordsInfo[devIndex].addr = cmplsRecordsAddr;

@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/Apache-2.0.txt for more license information
  *************************************************************************/
 
 #ifndef NET_IB_CONNECT_H_
@@ -34,6 +34,17 @@ struct ncclIbQpInfo {
   // receiver side to have asymmetric device configuration, meaning the sender
   // and receiver can use different number of devices.
   int devIndex;
+};
+
+// Forced-mode device-list exchange, preceding all QP allocation. The prefix is
+// checked independently so a legacy device list can be rejected without waiting
+// for a larger message that the peer will never send. Ordinary mode is unchanged.
+struct occlIbGeometryOffer {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t qpsPerConnection;
+  uint32_t activeWidth;
+  ncclNetVDeviceProps_t privateProps;
 };
 
 struct ncclIbResiliencyInfo {

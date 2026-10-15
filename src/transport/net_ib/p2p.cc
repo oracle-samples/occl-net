@@ -1,8 +1,15 @@
 /*************************************************************************
+ * Copyright (c) 2026 Oracle and/or its affiliates.
+ * Modifications by Oracle and/or its affiliates are licensed under the
+ * Universal Permissive License (UPL), Version 1.0. See LICENSE.txt.
+ * Modified by Oracle and/or its affiliates on 2026-03-06.
+ *************************************************************************/
+
+/*************************************************************************
  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/Apache-2.0.txt for more license information
  *************************************************************************/
 
 #include "p2p.h"
@@ -48,7 +55,7 @@ static inline void ibFrmFlushTelemetry(struct ncclIbSendComm* comm) {
   memset(comm->base.frmCold.qp_raw_lat, 0, sizeof(comm->base.frmCold.qp_raw_lat));
   memset(comm->base.frmCold.qp_lat_bytes, 0, sizeof(comm->base.frmCold.qp_lat_bytes));
   memset(comm->base.frmFields.completion.qp_zero_stamp_holdoff, 0, sizeof(comm->base.frmFields.completion.qp_zero_stamp_holdoff));
-  for (int qpIndex = 0; qpIndex < comm->base.nqps; qpIndex++) {
+  for (int qpIndex = 0; qpIndex < occlIbCommPhysicalQpCount(&comm->base); qpIndex++) {
     ncclIbQp* qp = &comm->base.qps[qpIndex];
     qp->sig_tail = qp->sig_head;
     memset(qp->sig_tsc, 0, sizeof(qp->sig_tsc));
@@ -415,11 +422,42 @@ static ncclResult_t ncclIbPrintWr(struct ibv_send_wr* wr, char* wrStr) {
 // The alignment for IB writes that is required to make LL and LL128 protocols work
 #define IB_WRITE_CHUNK_ALIGNMENT 128
 
+static inline int occlIbRequestPoolIndex(
+    const struct ncclIbSendComm* comm, const struct ncclIbRequest* request) {
+  assert(comm != NULL && request != NULL);
+  const int requestIndex = request - comm->base.reqs;
+  assert(requestIndex >= 0 && requestIndex < NET_IB_MAX_REQUESTS);
+  return requestIndex;
+}
+
+static inline void occlIbReplayPlanReset(
+    struct ncclIbSendComm* comm, const struct ncclIbRequest* request) {
+  if (comm->multiSendScratch.replayPlanFrozen == NULL) return;
+  comm->multiSendScratch.replayPlanFrozen[occlIbRequestPoolIndex(comm, request)] = 0;
+}
+
+template <bool useStandbyPaths>
 static ncclResult_t ibMultiSendBaseline(struct ncclIbSendComm* comm, int slot) {
   struct ncclIbRequest** reqs = comm->sendReqs[slot];
   volatile struct ncclIbSendFifo* slots = comm->ctsFifo[slot];
   int nreqs = slots[0].nreqs;
   if (nreqs > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
+
+  uint32_t* replayPlanRows[NCCL_NET_IB_MAX_RECVS] = {};
+  int replayPlanIndices[NCCL_NET_IB_MAX_RECVS] = {};
+  bool replayPlanWasFrozen[NCCL_NET_IB_MAX_RECVS] = {};
+  const bool useReplayPlan = comm->base.resiliency != NULL && comm->cim != NULL;
+  if (useReplayPlan) {
+    if (comm->multiSendScratch.replayPlanBytes == NULL ||
+        comm->multiSendScratch.replayPlanFrozen == NULL) return ncclInternalError;
+    for (int r = 0; r < nreqs; r++) {
+      replayPlanIndices[r] = occlIbRequestPoolIndex(comm, reqs[r]);
+      replayPlanRows[r] = occlIbMultiSendScratchReplayPlanRow(
+          &comm->multiSendScratch, replayPlanIndices[r]);
+      replayPlanWasFrozen[r] =
+          comm->multiSendScratch.replayPlanFrozen[replayPlanIndices[r]] != 0;
+    }
+  }
 
   TRACE(NCCL_NET, "NET/IB: %s: Posting a send request (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d)", __func__, reqs[0], reqs[0]->base, reqs[0]->id, slot, nreqs);
 
@@ -492,13 +530,35 @@ static ncclResult_t ibMultiSendBaseline(struct ncclIbSendComm* comm, int slot) {
   for (int i = 0; i < nqps; i++) {
     NCCLCHECK(ncclIbCommBaseGetQpForRequest(&comm->base, reqs[0]->id, i, &qp, &qpIndex));
 
+    if (useReplayPlan) {
+      for (int r = 0; r < nreqs; r++) {
+        const uint32_t remaining = std::max(0, reqs[r]->send.size - (int)sendOffsets[r]);
+        uint32_t length = replayPlanWasFrozen[r] ? replayPlanRows[r][qpIndex] :
+            DIVUP(DIVUP(reqs[r]->send.size, nqps), IB_WRITE_CHUNK_ALIGNMENT) * IB_WRITE_CHUNK_ALIGNMENT;
+        length = std::min(length, remaining);
+        if (!replayPlanWasFrozen[r]) replayPlanRows[r][qpIndex] = length;
+        comm->sges[r].addr = (uintptr_t)reqs[r]->send.data + sendOffsets[r];
+        comm->sges[r].length = length;
+        comm->wrs[r].wr.rdma.remote_addr = slots[r].addr + sendOffsets[r];
+        comm->wrs[r].num_sge = length == 0 ? 0 : 1;
+      }
+    }
+
     TRACE(NCCL_NET, "NET/IB: %s: Posting send (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d, wr_id=%ld) on QP (qp_num=%u, devIndex=%d, logicalQpIndex=%d)", __func__, reqs[0], reqs[0]->base, reqs[0]->id, slot, nreqs, wr_id, qp->qp->qp_num, qp->devIndex, qpIndex);
 
     // Skip logical chunks that were already credited by the probing path.
     if (comm->base.resiliency && reqs[0]->send.pendingData[qpIndex] == false) {
       for (int r=0; r<nreqs; r++) {
-        comm->wrs[r].sg_list->addr += comm->wrs[r].sg_list->length;
-        comm->wrs[r].wr.rdma.remote_addr += comm->wrs[r].sg_list->length;
+        // Delivered chunks still consume their original byte range. Clamp
+        // aligned tail chunks too, so later zero-byte lanes stay zero on replay.
+        const uint32_t remaining = std::max(0, reqs[r]->send.size - (int)sendOffsets[r]);
+        const uint32_t skippedBytes = std::min(comm->wrs[r].sg_list->length, remaining);
+        sendOffsets[r] += skippedBytes;
+        if (!useReplayPlan) {
+          comm->wrs[r].sg_list->length = skippedBytes;
+          comm->wrs[r].sg_list->addr += skippedBytes;
+          comm->wrs[r].wr.rdma.remote_addr += skippedBytes;
+        }
       }
       TRACE(NCCL_NET, "NET/IB: %s: Skipping logical QP index %d (req=%p, slot=%d) as it was already delivered.", __func__, qpIndex, reqs[0], slot);
       continue;
@@ -506,7 +566,8 @@ static ncclResult_t ibMultiSendBaseline(struct ncclIbSendComm* comm, int slot) {
 
     int devIndex = qp->devIndex;
     int physicalQpIndex = qp - comm->base.qps;
-    assert(physicalQpIndex >= 0 && physicalQpIndex < comm->base.nqps);
+    const int qpCount = useStandbyPaths ? occlIbCommPhysicalQpCount(&comm->base) : comm->base.nqps;
+    assert(physicalQpIndex >= 0 && physicalQpIndex < qpCount);
     for (int r=0; r<nreqs; r++) {
       // Track this event for completion
       //ncclIbAddEvent(reqs[r], devIndex);
@@ -516,7 +577,10 @@ static ncclResult_t ibMultiSendBaseline(struct ncclIbSendComm* comm, int slot) {
 
       // Check the data left to send. If the send is too small, it might be
       // that on the current QP there is no data left to be sent.
-      comm->wrs[r].sg_list->length = std::min(reqs[r]->send.size-sendOffsets[r], comm->wrs[r].sg_list->length);
+      if (!useReplayPlan) {
+        comm->wrs[r].sg_list->length = std::min(
+            reqs[r]->send.size-sendOffsets[r], comm->wrs[r].sg_list->length);
+      }
       if (comm->wrs[r].sg_list->length == 0) {
         comm->wrs[r].num_sge = 0;
       } else {
@@ -531,8 +595,10 @@ static ncclResult_t ibMultiSendBaseline(struct ncclIbSendComm* comm, int slot) {
       lastWr->sg_list = &(comm->devs[devIndex].sge);
       lastWr->sg_list[0].addr = (uint64_t)(comm->remCmplsRecords.elems[slot]);
       lastWr->sg_list[0].length = nreqs*sizeof(int);
-      // Populate the correct RKey based on the device used
-      lastWr->wr.rdma.rkey = comm->remCmplsRecords.rkeys[devIndex];
+      // The SGE is local-device specific, while the RKey belongs to the remote
+      // device paired with this QP. Those indices can differ for asymmetric
+      // merged-device widths.
+      lastWr->wr.rdma.rkey = comm->remCmplsRecords.rkeys[qp->remDevIdx];
     }
 
     struct ibv_send_wr* bad_wr;
@@ -542,7 +608,7 @@ static ncclResult_t ibMultiSendBaseline(struct ncclIbSendComm* comm, int slot) {
       // Store the qpIndex for this request
       int nEventHandles = reqs[r]->pInfo[0].nEventHandles;
       assert(nEventHandles < MAX_QPS_PER_REQ);
-      reqs[r]->pInfo[0].qpIndex[nEventHandles] = qpIndex;
+      reqs[r]->pInfo[0].qpIndex[nEventHandles] = useStandbyPaths ? physicalQpIndex : qpIndex;
       // Store info for profiler
       int64_t pluginId = NCCL_PROFILER_NET_TYPE_IB | NCCL_PROFILER_NET_IB_VER;
       reqs[r]->pInfo[0].data.type = ncclProfileQp;
@@ -581,10 +647,18 @@ static ncclResult_t ibMultiSendBaseline(struct ncclIbSendComm* comm, int slot) {
     // actual data size that was sent on the current QP, for every request
     for (int r=0; r<nreqs; r++) {
       sendOffsets[r] = std::min<uint32_t>(sendOffsets[r] + comm->wrs[r].sg_list->length, reqs[r]->send.size);
-      comm->wrs[r].sg_list->addr += comm->wrs[r].sg_list->length;
-      comm->wrs[r].wr.rdma.remote_addr += comm->wrs[r].sg_list->length;
+      if (!useReplayPlan) {
+        comm->wrs[r].sg_list->addr += comm->wrs[r].sg_list->length;
+        comm->wrs[r].wr.rdma.remote_addr += comm->wrs[r].sg_list->length;
+      }
       TRACE(NCCL_NET, "NET/IB: %s: Send request (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d, reqIdx=%d, wr_id=%ld) posted %d bytes on logical QP index %d via physical QP index %d (devIndex=%d, qp_num=%u), total posted %d/%d bytes", __func__, reqs[r], reqs[0]->base, reqs[r]->id, slot, nreqs, r, comm->wrs[r].wr_id, comm->wrs[r].sg_list->length, qpIndex, physicalQpIndex, devIndex, qp->qp->qp_num, sendOffsets[r], reqs[r]->send.size);
       reqs[r]->send.pendingData[qpIndex] = true;
+    }
+  }
+
+  if (useReplayPlan) {
+    for (int r = 0; r < nreqs; r++) {
+      comm->multiSendScratch.replayPlanFrozen[replayPlanIndices[r]] = 1;
     }
   }
 
@@ -601,6 +675,7 @@ static ncclResult_t ibMultiSendBaseline(struct ncclIbSendComm* comm, int slot) {
 //   wr_id lookup path
 // - already-delivered logical lanes must still advance the shadow offsets
 //   before the post is skipped so replay bookkeeping remains stable
+template <bool useStandbyPaths>
 static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bool trackResiliency) {
   static int g_lat_src_set = 0;
 
@@ -611,7 +686,27 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
 
   struct ncclIbMultiSendScratch* scratch = &comm->multiSendScratch;
   if (scratch->storage == NULL || scratch->nqps < comm->base.nqps) {
-    return ibMultiSendBaseline(comm, slot);
+    if (trackResiliency) {
+      WARN("NET/IB: Resilient FRM communicator %p has no replay-plan storage", comm);
+      return ncclInternalError;
+    }
+    return ibMultiSendBaseline<useStandbyPaths>(comm, slot);
+  }
+
+  const bool useReplayPlan = trackResiliency;
+  uint32_t* replayPlanRows[NCCL_NET_IB_MAX_RECVS] = {};
+  int replayPlanIndices[NCCL_NET_IB_MAX_RECVS] = {};
+  bool replayPlanWasFrozen[NCCL_NET_IB_MAX_RECVS] = {};
+  if (useReplayPlan) {
+    if (scratch->replayPlanBytes == NULL || scratch->replayPlanFrozen == NULL) {
+      WARN("NET/IB: Invalid resilient replay-plan state on communicator %p", comm);
+      return ncclInternalError;
+    }
+    for (int r = 0; r < nreqs; r++) {
+      replayPlanIndices[r] = occlIbRequestPoolIndex(comm, reqs[r]);
+      replayPlanRows[r] = occlIbMultiSendScratchReplayPlanRow(scratch, replayPlanIndices[r]);
+      replayPlanWasFrozen[r] = scratch->replayPlanFrozen[replayPlanIndices[r]] != 0;
+    }
   }
 
   TRACE(NCCL_NET, "NET/IB: %s: Posting %s send request (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d)",
@@ -776,7 +871,8 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
 #ifdef NCCL_ENABLE_NET_PROFILING
       int nEventHandles = req->pInfo[0].nEventHandles;
       assert(nEventHandles < MAX_QPS_PER_REQ);
-      req->pInfo[0].qpIndex[nEventHandles] = logicalQpIndex;
+      req->pInfo[0].qpIndex[nEventHandles] = useStandbyPaths ?
+          (int)(qp - comm->base.qps) : logicalQpIndex;
       int64_t pluginId = NCCL_PROFILER_NET_TYPE_IB | NCCL_PROFILER_NET_IB_VER;
       req->pInfo[0].data.type = ncclProfileQp;
       req->pInfo[0].data.qp.device = devIndex;
@@ -833,15 +929,21 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       ncclIbQp* qp = NULL;
       NCCLCHECK(ncclIbCommBaseGetQpForRequest(&comm->base, req->id, i, &qp, &logicalQpIndex));
       int physicalQpIndex = qp - comm->base.qps;
-      assert(physicalQpIndex >= 0 && physicalQpIndex < comm->base.nqps);
+      const int qpCount = useStandbyPaths ? occlIbCommPhysicalQpCount(&comm->base) : comm->base.nqps;
+      assert(physicalQpIndex >= 0 && physicalQpIndex < qpCount);
 
       size_t remaining = (size_t)(req->send.size - reqOffset);
-      size_t cs = !useFrmNow ? (size_t)scratch->equalChunkSize[0] : (split ? chunkRow[logicalQpIndex] : chunkRow[i]);
+      const bool useFrozenPlan = useReplayPlan && replayPlanWasFrozen[0];
+      size_t cs = useFrozenPlan ? (size_t)replayPlanRows[0][logicalQpIndex] :
+          (!useFrmNow ? (size_t)scratch->equalChunkSize[0] : (split ? chunkRow[logicalQpIndex] : chunkRow[i]));
       if (cs > remaining) cs = remaining;
       const int length = (int)cs;
       const size_t sendSz = (size_t)(length > 0 ? length : 0);
       const uintptr_t curSgeAddr = sgeAddr;
       const uint64_t curRemoteAddr = remoteAddr;
+      if (useReplayPlan && !replayPlanWasFrozen[0]) {
+        replayPlanRows[0][logicalQpIndex] = (uint32_t)sendSz;
+      }
       reqOffset += (int)sendSz;
       sgeAddr += sendSz;
       remoteAddr += sendSz;
@@ -912,7 +1014,7 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
 #ifdef NCCL_ENABLE_NET_PROFILING
       int nEventHandles = req->pInfo[0].nEventHandles;
       assert(nEventHandles < MAX_QPS_PER_REQ);
-      req->pInfo[0].qpIndex[nEventHandles] = logicalQpIndex;
+      req->pInfo[0].qpIndex[nEventHandles] = useStandbyPaths ? physicalQpIndex : logicalQpIndex;
       int64_t pluginId = NCCL_PROFILER_NET_TYPE_IB | NCCL_PROFILER_NET_IB_VER;
       req->pInfo[0].data.type = ncclProfileQp;
       req->pInfo[0].data.qp.device = devIndex;
@@ -942,7 +1044,8 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       ncclIbQp* qp = NULL;
       NCCLCHECK(ncclIbCommBaseGetQpForRequest(&comm->base, reqs[0]->id, i, &qp, &logicalQpIndex));
       int physicalQpIndex = qp - comm->base.qps;
-      assert(physicalQpIndex >= 0 && physicalQpIndex < comm->base.nqps);
+      const int qpCount = useStandbyPaths ? occlIbCommPhysicalQpCount(&comm->base) : comm->base.nqps;
+      assert(physicalQpIndex >= 0 && physicalQpIndex < qpCount);
 
       const bool skipDelivered = trackResiliency && reqs[0]->send.pendingData[logicalQpIndex] == false;
       struct ibv_send_wr* postWrs = ncclIbMultiSendScratchWrRow(scratch, postCount);
@@ -964,12 +1067,16 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
         uintptr_t curSgeAddr = scratch->sgeAddrShadow[r];
         uint64_t curRemoteAddr = scratch->remoteAddrShadow[r];
         size_t remaining = (size_t)(reqs[r]->send.size - scratch->reqOffsetShadow[r]);
-        size_t cs = !useFrmNow ?
-            (size_t)scratch->equalChunkSize[r] :
-            ncclIbMultiSendScratchChunkRow(scratch, r)[split ? logicalQpIndex : i];
+        const bool useFrozenPlan = useReplayPlan && replayPlanWasFrozen[r];
+        size_t cs = useFrozenPlan ? (size_t)replayPlanRows[r][logicalQpIndex] :
+            (!useFrmNow ? (size_t)scratch->equalChunkSize[r] :
+             ncclIbMultiSendScratchChunkRow(scratch, r)[split ? logicalQpIndex : i]);
         if (cs > remaining) cs = remaining;
         const int length = (int)cs;
         const size_t sendSz = (size_t)(length > 0 ? length : 0);
+        if (useReplayPlan && !replayPlanWasFrozen[r]) {
+          replayPlanRows[r][logicalQpIndex] = (uint32_t)sendSz;
+        }
 
         scratch->reqOffsetShadow[r] += (int)sendSz;
         scratch->sgeAddrShadow[r] += sendSz;
@@ -1033,14 +1140,14 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
       postImmWr->num_sge = 1;
       postImmWr->sg_list[0].addr = (uint64_t)(comm->remCmplsRecords.elems[slot]);
       postImmWr->sg_list[0].length = nreqs * sizeof(int);
-      postImmWr->wr.rdma.rkey = comm->remCmplsRecords.rkeys[qp->devIndex];
+      postImmWr->wr.rdma.rkey = comm->remCmplsRecords.rkeys[qp->remDevIdx];
       postImmWr->wr.rdma.remote_addr = remSizesRemoteAddr;
 
 #ifdef NCCL_ENABLE_NET_PROFILING
       for (int r = 0; r < nreqs; r++) {
         int nEventHandles = reqs[r]->pInfo[0].nEventHandles;
         assert(nEventHandles < MAX_QPS_PER_REQ);
-        reqs[r]->pInfo[0].qpIndex[nEventHandles] = logicalQpIndex;
+        reqs[r]->pInfo[0].qpIndex[nEventHandles] = useStandbyPaths ? physicalQpIndex : logicalQpIndex;
         int64_t pluginId = NCCL_PROFILER_NET_TYPE_IB | NCCL_PROFILER_NET_IB_VER;
         int wrSlot = dataWrSlotByReq[r];
         reqs[r]->pInfo[0].data.type = ncclProfileQp;
@@ -1107,20 +1214,26 @@ static ncclResult_t ibFrmMultiSendCore(struct ncclIbSendComm* comm, int slot, bo
 
   ibFrmFinalizeDebugPublishing(comm, dbgLatEnabled, &g_lat_src_set);
 
+  if (useReplayPlan) {
+    for (int r = 0; r < nreqs; r++) {
+      scratch->replayPlanFrozen[replayPlanIndices[r]] = 1;
+    }
+  }
+
   return ncclSuccess;
 }
 
-static ncclResult_t ibMultiSendFrmResiliency(struct ncclIbSendComm* comm, int slot) {
-  // Combined mode reuses the same send planner, but replay/failover ownership
-  // stays in the resiliency code and completion lookup stays on the baseline
-  // wr_id path.
-  return ibFrmMultiSendCore(comm, slot, true);
-}
-
 ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
-  if (!ibFrmEnabledForSend(comm)) return ibMultiSendBaseline(comm, slot);
-  if (comm->base.resiliency != NULL) return ibMultiSendFrmResiliency(comm, slot);
-  return ibFrmMultiSendCore(comm, slot, false);
+  const bool frmEnabled = ibFrmEnabledForSend(comm);
+  if (!frmEnabled) {
+    return comm->base.hasStandbyPaths ?
+        ibMultiSendBaseline<true>(comm, slot) : ibMultiSendBaseline<false>(comm, slot);
+  }
+  if (comm->base.hasStandbyPaths) {
+    return ibFrmMultiSendCore<true>(comm, slot, comm->base.resiliency != NULL);
+  }
+  if (comm->base.resiliency != NULL) return ibFrmMultiSendCore<false>(comm, slot, true);
+  return ibFrmMultiSendCore<false>(comm, slot, false);
 }
 
 ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void* mhandle, void* phandle, void** request) {
@@ -1176,6 +1289,9 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, size_t size, int tag, void*
       memset(req->send.lastAttemptQpIndex, 0xff, sizeof(req->send.lastAttemptQpIndex));
       memset(req->send.lastAttemptOrder, 0, sizeof(req->send.lastAttemptOrder));
       memset(req->send.ackedCompletions, 0, sizeof(req->send.ackedCompletions));
+      // The row is overwritten lane-by-lane on the first post. Reset only
+      // ownership so request-pool reuse cannot inherit a stale plan.
+      occlIbReplayPlanReset(comm, req);
     }
 #ifdef NCCL_ENABLE_NET_PROFILING
     req->pInfo[0].pHandle = phandle;
@@ -1265,9 +1381,10 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, struct ncclIbRequest* r
   //    polling it will empty the Send Queue, can be posted)
   //  - The status of all posted Send Request is considered unknown
   //
-  // slot == devIndex - When writing to CTS FIFO slot N, and this QP lives on device index N, it should send signalled.
-  // This works out that each CTS posting QP gets drained
-  if (slot == ctsQp->devIndex || comm->base.resiliency) {
+  // Direct geometry retains legacy device-based signaling. Standby geometry
+  // rotates CTS traffic by logical lane, so signal that selected lane instead.
+  const int periodicSignalIndex = comm->base.hasStandbyPaths ? ctsQp->logicalLane : ctsQp->devIndex;
+  if (slot == periodicSignalIndex || comm->base.resiliency) {
     wr.send_flags |= IBV_SEND_SIGNALED;
     wr.wr_id = ibReqWrIdEncode(req->id);
   }
@@ -1332,7 +1449,7 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, size_t* sizes, int*
     for (int r = 0; r < n; r++) {
       int nEventHandles = req->pInfo[r].nEventHandles;
       assert(nEventHandles < MAX_QPS_PER_REQ);
-      req->pInfo[r].qpIndex[nEventHandles] = qpIndex;
+      req->pInfo[r].qpIndex[nEventHandles] = (int)(qp - comm->base.qps);
       // Store info for profiler
       int64_t pluginId = NCCL_PROFILER_NET_TYPE_IB | NCCL_PROFILER_NET_IB_VER;
       req->pInfo[r].data.type = ncclProfileQp;
@@ -1419,7 +1536,9 @@ ncclResult_t ncclIbIflush(void* recvComm, int n, void** data, int* sizes, void**
 
 #ifdef NCCL_ENABLE_NET_PROFILING
 static int getReqQpIndex(struct ncclIbRequest* req, int request, int qpNumber) {
-  for (int i = 0; i < MAX_QPS_PER_REQ; i++) {
+  const int nEventHandles = req->pInfo[request].nEventHandles;
+  assert(nEventHandles >= 0 && nEventHandles <= MAX_QPS_PER_REQ);
+  for (int i = 0; i < nEventHandles; i++) {
     int qpIndex = req->pInfo[request].qpIndex[i];
     if (req->base->qps[qpIndex].qp->qp_num == qpNumber) return i;
   }
@@ -1470,12 +1589,18 @@ static inline bool ncclIbRequestIsComplete(struct ncclIbRequest *request) {
   const int ev1 = request->events[1];
   const int ev2 = request->events[2];
   const int ev3 = request->events[3];
-  bool complete = (ev0 == 0 && ev1 == 0 && ev2 == 0 && ev3 == 0);
+  int eventBits = ev0 | ev1 | ev2 | ev3;
+  if (__builtin_expect(request->base->vProps.ndevs > 4, 0)) {
+    for (int devIndex = 4; devIndex < request->base->vProps.ndevs; devIndex++) {
+      eventBits |= request->events[devIndex];
+    }
+  }
+  bool complete = eventBits == 0;
   if (!complete && request->base->resiliency) {
     // Healthy resiliency keeps request event counters non-negative. The slow
     // helper is only needed once failover introduces negative rebalanced
     // counters that can satisfy the alternate completion condition.
-    if (__builtin_expect((ev0 | ev1 | ev2 | ev3) >= 0, 1)) return false;
+    if (__builtin_expect(eventBits >= 0, 1)) return false;
     NCCLCHECK(ncclIbResiliencyRequestIsComplete(request, &complete));
   }
   return complete;
@@ -1523,16 +1648,31 @@ static inline ncclResult_t ncclIbRequestComplete(struct ncclIbRequest* r, int* d
   return ncclSuccess;
 }
 
+static int occlIbCompletionRemoteDeviceIndex(struct ncclIbNetCommBase* commBase, const struct ibv_wc* wc, int devIndex) {
+  struct ncclIbQp* qp = NULL;
+  if (devIndex >= 0 && devIndex < commBase->vProps.ndevs &&
+      ncclIbCommBaseGetQpByQpNum(commBase, devIndex, wc->qp_num, &qp, NULL) == ncclSuccess &&
+      qp != NULL && qp->remDevIdx >= 0 && qp->remDevIdx < commBase->nRemDevs) {
+    return qp->remDevIdx;
+  }
+  // Preserve the legacy symmetric mapping when the CQE cannot be associated
+  // with a data QP (for example, a flush or auxiliary completion).
+  return devIndex >= 0 && devIndex < commBase->nRemDevs ? devIndex : -1;
+}
+
 // Log the details of a completion with error. The provided devIndex is the index
-// of the IB device on which the completion was received.
+// of the local IB device on which the completion was received.
 static ncclResult_t ncclIbLogCompletionWithError(struct ncclIbNetCommBase* commBase, struct ibv_wc* wc, int devIndex) {
   struct ncclIbNetCommDevBase* devBase = ncclIbGetNetCommDevBase(commBase, devIndex);
+  const int remoteDevIndex = occlIbCompletionRemoteDeviceIndex(commBase, wc, devIndex);
   char localGidString[INET6_ADDRSTRLEN] = "";
   char remoteGidString[INET6_ADDRSTRLEN] = "";
   const char* localGidStr = NULL, *remoteGidStr = NULL;
   if (devBase->gidInfo.link_layer == IBV_LINK_LAYER_ETHERNET) {
     localGidStr = ibvGetGidStr(&devBase->gidInfo.localGid, localGidString, sizeof(localGidString));
-    remoteGidStr = ibvGetGidStr(&commBase->remDevs[devIndex].remoteGid, remoteGidString, sizeof(remoteGidString));
+    if (remoteDevIndex >= 0) {
+      remoteGidStr = ibvGetGidStr(&commBase->remDevs[remoteDevIndex].remoteGid, remoteGidString, sizeof(remoteGidString));
+    }
   }
 
   char sockStr[SOCKET_NAME_MAXLEN+1];
@@ -1684,33 +1824,37 @@ static inline uint64_t norm_lat_us_per_mtu(uint64_t raw_us, uint32_t bytes) {
   return ((adj_us * (uint64_t)FRM_LAT_NORM_MTU_BYTES) / (uint64_t)bytes) + 1;
 }
 
+template <bool useStandbyPaths>
 static inline void ibFrmUpdateLatencyStamp(struct ncclIbRequest* req, struct ibv_wc* wc, bool captureRawLat) {
   if (req == NULL || req->base == NULL || wc == NULL) return;
   if (wc->opcode != IBV_WC_RDMA_WRITE) return;
 
-  int qpIndex = qpMapFind(&req->base->frmFields.completion.qpHash, wc->qp_num);
-  if ((unsigned)qpIndex >= (unsigned)req->base->nqps) return;
+  int physicalQpIndex = qpMapFind(&req->base->frmFields.completion.qpHash, wc->qp_num);
+  const int qpCount = useStandbyPaths ? occlIbCommPhysicalQpCount(req->base) : req->base->nqps;
+  if ((unsigned)physicalQpIndex >= (unsigned)qpCount) return;
 
   static const uint8_t kZeroStampHoldoff = []() -> uint8_t {
     const int64_t value = ncclParamFrmZeroStampHoldoff();
     return (uint8_t)(value <= 0 ? 0 : (value >= 255 ? 255 : value));
   }();
 
-  ncclIbQp* qp = &req->base->qps[qpIndex];
+  ncclIbQp* qp = &req->base->qps[physicalQpIndex];
+  const int logicalLane = useStandbyPaths ? qp->logicalLane : physicalQpIndex;
+  if (useStandbyPaths && (unsigned)logicalLane >= (unsigned)req->base->nqps) return;
   uint64_t t0 = 0;
   uint32_t bytes = 0;
   if (!ibQpSigPop(qp, &t0, &bytes)) return;
   // Apply the same zero-byte holdoff to all FRM completion stamps so the
   // single-request send fast path does not bypass congestion responsiveness.
   if (bytes == 0 && kZeroStampHoldoff != 0) {
-    uint8_t skip = req->base->frmFields.completion.qp_zero_stamp_holdoff[qpIndex];
+    uint8_t skip = req->base->frmFields.completion.qp_zero_stamp_holdoff[logicalLane];
     if (skip < kZeroStampHoldoff) {
-      req->base->frmFields.completion.qp_zero_stamp_holdoff[qpIndex] = (uint8_t)(skip + 1);
+      req->base->frmFields.completion.qp_zero_stamp_holdoff[logicalLane] = (uint8_t)(skip + 1);
       return;
     }
-    req->base->frmFields.completion.qp_zero_stamp_holdoff[qpIndex] = 0;
+    req->base->frmFields.completion.qp_zero_stamp_holdoff[logicalLane] = 0;
   } else {
-    req->base->frmFields.completion.qp_zero_stamp_holdoff[qpIndex] = 0;
+    req->base->frmFields.completion.qp_zero_stamp_holdoff[logicalLane] = 0;
   }
 
   uint64_t t1 = timer_get_cycles();
@@ -1718,12 +1862,13 @@ static inline void ibFrmUpdateLatencyStamp(struct ncclIbRequest* req, struct ibv
 
   uint64_t us = (uint64_t)((double)(t1 - t0) * g_inv_cyc_per_us);
   if (captureRawLat) {
-    req->base->frmCold.qp_raw_lat[qpIndex] = us;
+    req->base->frmCold.qp_raw_lat[logicalLane] = us;
   }
-  req->base->frmFields.send.qp_lat[qpIndex] = norm_lat_us_per_mtu(us, bytes);
-  req->base->frmCold.qp_lat_bytes[qpIndex] = bytes;
+  req->base->frmFields.send.qp_lat[logicalLane] = norm_lat_us_per_mtu(us, bytes);
+  req->base->frmCold.qp_lat_bytes[logicalLane] = bytes;
 }
 
+template <bool useStandbyPaths>
 static ncclResult_t ibTestBaseline(void* request, int* done, int* sizes) {
   struct ncclIbRequest *r = (struct ncclIbRequest*)request;
   *done = 0;
@@ -1774,7 +1919,7 @@ static ncclResult_t ibTestBaseline(void* request, int* done, int* sizes) {
           TRACE(NCCL_NET, "NET/IB: %s: Processing a completion event (devIndex=%d, comm=%p (%s), req=%p, wr_id=%lu, qp_num=%d)", __func__, i, r->base, r->base->isSend ? "send" : "recv", r, wc->wr_id, wc->qp_num);
           NCCLCHECK(ncclIbCompletionEventProcess(r->base, wc, i));
           if (frmComm != NULL && ibFrmGateUpdate(frmComm)) {
-            ibFrmUpdateLatencyStamp(r, wc, captureRawLat);
+            ibFrmUpdateLatencyStamp<useStandbyPaths>(r, wc, captureRawLat);
           }
         }
       }
@@ -1788,12 +1933,10 @@ static ncclResult_t ibTestBaseline(void* request, int* done, int* sizes) {
   return ncclSuccess;
 }
 
-ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
+template <bool useStandbyPaths>
+static ncclResult_t ibTestFrm(void* request, int* done, int* sizes) {
   struct ncclIbRequest* r = (struct ncclIbRequest*)request;
   *done = 0;
-
-  if (!ibFrmEnabledForTest(r)) return ibTestBaseline(request, done, sizes);
-
   struct ncclIbSendComm* frmComm = (struct ncclIbSendComm*)r->base;
   constexpr bool captureRawLat = (FRM_LAT_PRINT_MS > 0);
   bool frmTelemetryEnabled = true;
@@ -1837,11 +1980,23 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
         NCCLCHECK(ncclIbCompletionEventProcess(r->base, wc, i));
         if (!frmTelemetryEnabled) continue;
 
-        ibFrmUpdateLatencyStamp(r, wc, captureRawLat);
+        ibFrmUpdateLatencyStamp<useStandbyPaths>(r, wc, captureRawLat);
       }
       NCCLCHECK(ncclIbStatsCheckFatalCount(&ncclIbDevs[r->devBases[i]->ibDevN].stats,__func__));
     }
   } while (totalWrDone > 0);
 
   return ncclSuccess;
+}
+
+ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
+  struct ncclIbRequest* r = (struct ncclIbRequest*)request;
+  *done = 0;
+  const bool useStandbyPaths = r != NULL && r->base != NULL && r->base->hasStandbyPaths;
+  if (!ibFrmEnabledForTest(r)) {
+    return useStandbyPaths ?
+        ibTestBaseline<true>(request, done, sizes) : ibTestBaseline<false>(request, done, sizes);
+  }
+  return useStandbyPaths ?
+      ibTestFrm<true>(request, done, sizes) : ibTestFrm<false>(request, done, sizes);
 }

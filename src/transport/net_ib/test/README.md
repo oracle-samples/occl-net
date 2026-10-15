@@ -1,14 +1,9 @@
 <!--
-Copyright (c) 2026 OCCL-net.
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-http://www.apache.org/licenses/LICENSE-2.0
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+ Copyright (c) 2026 Oracle and/or its affiliates.
+ SPDX-License-Identifier: UPL-1.0
+
+ Licensed under the Universal Permissive License (UPL), Version 1.0.
+ See LICENSE.txt.
 -->
 
 # Net-IB Tests
@@ -58,23 +53,24 @@ cmake --build build-net-ib-tests \
   --parallel
 ```
 
-The unified runner performs the same configure/build steps and then runs tests.
-Use `--unit-only` for the dev-container gate before upload:
+The unified runner performs the same configure/build steps before running the selected tests. On
+a host, or in a container with an incomplete toolchain, `--unit-only` automatically uses the
+dedicated unit-test image:
 
 ```bash
-bash scripts/run_net_ib_tests.sh --unit-only build-net-ib-tests
+bash scripts/tests/run_net_ib_tests.sh --unit-only build-net-ib-tests
 ```
 
-Package tested artifacts from the dev container with:
+Package tested artifacts with:
 
 ```bash
-bash scripts/run_net_ib_tests.sh --unit-only \
+bash scripts/tests/run_net_ib_tests.sh --unit-only \
   --build-dir build-net-ib-dev \
   --package-dir build-net-ib-artifacts
 ```
 
-The package contains the tested plugin shared object, all net-IB test
-binaries, and the test runner script:
+The `--unit-only` package contains the tested plugin shared object, source/unit test binaries, and
+the test runner script. It does not contain the single-node binary:
 
 ```text
 build-net-ib-artifacts/
@@ -101,14 +97,45 @@ OCCL_NET_IB_SINGLE_NODE_TESTS=1 NCCL_DEBUG=WARN \
 Run all net-IB tests without coverage:
 
 ```bash
-bash scripts/run_net_ib_tests.sh build-net-ib-tests
+bash scripts/tests/run_net_ib_tests.sh build-net-ib-tests
 ```
 
 Run only unit tests:
 
 ```bash
-bash scripts/run_net_ib_tests.sh --unit-only build-net-ib-tests
+bash scripts/tests/run_net_ib_tests.sh --unit-only build-net-ib-tests
 ```
+
+When no custom CTest filter is used, `run_net_ib_tests.sh` prints structural source-level function
+coverage after the unit tests. The inventory contains production definitions from translation units
+owned by `occl-net-ib-plugin` and from the project headers they include. Direct coverage counts
+production functions that Clang resolves as direct `CALL_EXPR` targets in a GoogleTest body or in a
+test-only helper reachable from one.
+Inclusive coverage adds production functions reachable through the production call graph. These
+metrics do not measure line or branch execution coverage. `--show-uncovered` lists the exact
+complement of direct coverage and groups it into `Indirect-only` functions reached through that
+graph and `Fully uncovered` functions not reached at all. Both sections show their own count and
+group entries by production source file.
+
+Use either list option independently, or combine them:
+
+```bash
+bash scripts/tests/run_net_ib_tests.sh --unit-only --show-covered build-net-ib-tests
+bash scripts/tests/run_net_ib_tests.sh --unit-only --show-uncovered build-net-ib-tests
+```
+
+The dedicated unit-test image includes the `python3-clang-14` binding required by the reporter. The
+reporter fingerprints its selected project files, compilation database, and analyzer script. A
+cold report parses independent translation units in up to four isolated processes. It also caches
+each translation unit with its project-header dependencies, so a normal source edit reparses only
+affected units. When the complete fingerprint is unchanged, the reporter reuses the persisted result
+without parsing `compile_commands.json` or an AST. The unit-test binaries still run on every
+invocation.
+
+The standard net-IB CTest selection includes the reporter's Python regression suite, but it does not
+generate the project function report. In addition, `--output-on-failure` only displays a test
+program's stdout when that test fails. Use the runner command above when both the CTest results and
+function report are required.
 
 Run only unit tests from an existing build tree:
 
@@ -131,48 +158,55 @@ workspace:
 
 ```bash
 cd /path/to/occl-net-workspace
-bash scripts/run_net_ib_tests.sh --gpu-testbed --single-node-only
+bash scripts/tests/run_net_ib_tests.sh --gpu-testbed --single-node-only
 ```
 
-## Running With Coverage
+## Running With Runtime Coverage
 
-Coverage mode requires `lcov`, `python3`, CMake, and CTest. It builds the same
-unit and single-node test binaries with coverage instrumentation, runs tests,
-and writes the filtered report under:
+Runtime coverage mode requires `lcov`, `python3`, CMake, and CTest. It builds the selected test
+binaries with coverage instrumentation, runs them, prints the aggregate line and function
+percentages, and writes the filtered report under:
 
 ```text
 build/test/coverage/net_ib/
 ```
 
-Run all tests with coverage:
+Run CPU unit tests with runtime coverage from a host or container; the runner uses the dedicated
+unit-test image automatically when the local toolchain is incomplete:
 
 ```bash
-bash scripts/run_net_ib_tests.sh --coverage build-net-ib-coverage
+bash scripts/tests/run_net_ib_tests.sh --unit-only --coverage build-net-ib-coverage
+```
+
+Run all tests with runtime coverage in a configured environment:
+
+```bash
+bash scripts/tests/run_net_ib_tests.sh --coverage build-net-ib-coverage
 ```
 
 On a GPU/IB-capable host, include the single-node runtime gate:
 
 ```bash
 OCCL_NET_IB_SINGLE_NODE_TESTS=1 \
-  bash scripts/run_net_ib_tests.sh --coverage build-net-ib-gpu-coverage
+  bash scripts/tests/run_net_ib_tests.sh --coverage build-net-ib-gpu-coverage
 ```
 
 On a staged GPU/IB test bed workspace, use GPU test-bed mode with coverage:
 
 ```bash
 cd /path/to/occl-net-workspace
-bash scripts/run_net_ib_tests.sh --gpu-testbed --coverage
+bash scripts/tests/run_net_ib_tests.sh --gpu-testbed --coverage
 ```
 
-That coverage command requires native `lcov` on the host.
+GPU and combined coverage modes require native `lcov` in their configured environment.
 
-## Coverage Artifacts
+## Runtime Coverage Artifacts
 
-Coverage artifacts are written to `build/test/coverage/net_ib/`.
+Runtime coverage artifacts are written to `build/test/coverage/net_ib/`.
 
-`summary.txt` is the overall LCOV summary. It reports aggregate line and
-function coverage for filtered net-IB production sources. Branch coverage is
-currently not collected, so `branches...: no data found` is expected.
+`summary.txt` is the overall LCOV summary. It reports aggregate line and function coverage for
+filtered net-IB production sources. Branch coverage is currently not collected, so
+`branches...: no data found` is expected.
 
 `files.tsv` is the per-file breakdown generated by the runner. Columns are:
 
@@ -188,13 +222,11 @@ uncovered_lines
 first_uncovered_line_ranges
 ```
 
-Use `files.tsv` to find the source files and line ranges that need more tests.
+Use `files.tsv` to find production files and line ranges that need more runtime execution.
 
-`coverage.info` is the filtered LCOV tracefile. It contains the detailed
-machine-readable records used by LCOV tools. The runner filters the tracefile
-to `src/transport/net_ib` production files and excludes `test/` plus `gdaki/`.
-You can pass it to tools such as `lcov --summary` or `genhtml`.
+`coverage.info` is the filtered LCOV tracefile. The runner limits it to
+`src/transport/net_ib` production files and excludes `test/` plus `gdaki/`. It can be passed to
+tools such as `lcov --summary` or `genhtml`.
 
-`tests.log` is the CTest output captured during coverage mode. It is not part
-of the coverage math, but it records which tests ran, passed, failed, or
-skipped for that coverage run.
+`tests.log` is the CTest output captured during coverage mode. It records which tests ran, passed,
+failed, or skipped, but does not contribute to coverage calculations.

@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/Apache-2.0.txt for more license information
  *************************************************************************/
 
 #include "common.h"
@@ -72,6 +72,8 @@ void ncclIbSendCommFreeMultiSendScratch(struct ncclIbSendComm* comm) {
 #if FRM_DEBUG
   scratch->sendSzPerPost = NULL;
 #endif
+  scratch->replayPlanBytes = NULL;
+  scratch->replayPlanFrozen = NULL;
 }
 
 ncclResult_t ncclIbSendCommInitMultiSendScratch(struct ncclIbSendComm* comm) {
@@ -104,6 +106,9 @@ ncclResult_t ncclIbSendCommInitMultiSendScratch(struct ncclIbSendComm* comm) {
   const size_t sendSzRowBytes = ibFrmRoundUp(NCCL_NET_IB_MAX_RECVS * sizeof(uint32_t), sectorBytes);
   const size_t sendSzBytes = nqps * sendSzRowBytes;
 #endif
+  const bool allocateReplayPlan = comm->base.resiliency != NULL;
+  const size_t replayPlanBytes = allocateReplayPlan ? NET_IB_MAX_REQUESTS * nqps * sizeof(uint32_t) : 0;
+  const size_t replayPlanFrozenBytes = allocateReplayPlan ? NET_IB_MAX_REQUESTS * sizeof(uint8_t) : 0;
 
   assert(chunkRowBytes <= UINT32_MAX);
   assert(wrRowBytes <= UINT32_MAX);
@@ -149,6 +154,15 @@ ncclResult_t ncclIbSendCommInitMultiSendScratch(struct ncclIbSendComm* comm) {
   const size_t sendSzOffset = totalBytes;
   totalBytes += sendSzBytes;
 #endif
+  size_t replayPlanOffset = 0;
+  size_t replayPlanFrozenOffset = 0;
+  if (allocateReplayPlan) {
+    totalBytes = ibFrmRoundUp(totalBytes, sectorBytes);
+    replayPlanOffset = totalBytes;
+    totalBytes += replayPlanBytes;
+    replayPlanFrozenOffset = totalBytes;
+    totalBytes += replayPlanFrozenBytes;
+  }
 
   NCCLCHECKGOTO(ncclIbMalloc((void**)&scratch->storage, totalBytes), ret, fail);
   memset(scratch->storage, 0, totalBytes);
@@ -168,6 +182,10 @@ ncclResult_t ncclIbSendCommInitMultiSendScratch(struct ncclIbSendComm* comm) {
 #if FRM_DEBUG
     scratch->sendSzPerPost = (uint32_t*)(base + sendSzOffset);
 #endif
+    if (allocateReplayPlan) {
+      scratch->replayPlanBytes = (uint32_t*)(base + replayPlanOffset);
+      scratch->replayPlanFrozen = (uint8_t*)(base + replayPlanFrozenOffset);
+    }
   }
 
   for (size_t i = 0; i < nqps; i++) {
@@ -200,6 +218,7 @@ ncclResult_t ncclIbBaseCommInit(struct ncclIbNetCommBase* baseComm, bool isSend)
   for (int i = 0; i < NCCL_IB_MAX_QPS; i++) {
     baseComm->qps[i].devIndex= -1;
     baseComm->qps[i].remDevIdx= -1;
+    baseComm->qps[i].logicalLane = NCCL_IB_QP_COLD_INVALID;
     baseComm->qps[i].sig_head = 0;
     baseComm->qps[i].sig_tail = 0;
     memset(baseComm->qps[i].sig_tsc, 0, sizeof(baseComm->qps[i].sig_tsc));
@@ -213,6 +232,8 @@ ncclResult_t ncclIbBaseCommInit(struct ncclIbNetCommBase* baseComm, bool isSend)
     baseComm->activeQps[i] = &baseComm->qps[i];
   }
   baseComm->nqps = -1;
+  baseComm->nPhysicalQps = -1;
+  baseComm->hasStandbyPaths = false;
   baseComm->splitDataOnQps = ncclParamIbSplitDataOnQps();
   baseComm->nDataQps = -1;
   baseComm->connTc = 0;

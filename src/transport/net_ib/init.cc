@@ -1,11 +1,21 @@
 /*************************************************************************
+ * Copyright (c) 2026 Oracle and/or its affiliates.
+ * Modifications by Oracle and/or its affiliates are licensed under the
+ * Universal Permissive License (UPL), Version 1.0. See LICENSE.txt.
+ * Modified by Oracle and/or its affiliates on 2026-03-06.
+ *************************************************************************/
+
+/*************************************************************************
  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/Apache-2.0.txt for more license information
  *************************************************************************/
 
 #include "common.h"
+
+#include <algorithm>
+#include <limits>
 
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
@@ -140,59 +150,201 @@ failure:
   return false;
 }
 
-ncclResult_t ncclIbMakeVDeviceInternal(int* d, ncclNetVDeviceProps_t* props) {
-  if (ncclParamIbMergeNics() == 0 && props->ndevs > 1) {
-    INFO(NCCL_NET, "NET/IB : Skipping makeVDevice, NCCL_IB_MERGE_NICS=0");
+static bool occlIbForceMergeAliasesEnabled() {
+  const char* value = ncclGetEnv("NCCL_NET_FORCE_MERGE");
+  return value != NULL && value[0] != '\0';
+}
+
+static bool occlIbSameMemberSet(const ncclNetVDeviceProps_t* left, const ncclNetVDeviceProps_t* right) {
+  if (left == NULL || right == NULL || left->ndevs != right->ndevs) return false;
+  for (int i = 0; i < left->ndevs; i++) {
+    bool found = false;
+    for (int j = 0; j < right->ndevs; j++) {
+      if (left->devs[i] == right->devs[j]) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) return false;
+  }
+  return true;
+}
+
+static bool occlIbMemberSetsOverlap(const ncclNetVDeviceProps_t* left, const ncclNetVDeviceProps_t* right) {
+  if (left == NULL || right == NULL) return false;
+  for (int i = 0; i < left->ndevs; i++) {
+    for (int j = 0; j < right->ndevs; j++) {
+      if (left->devs[i] == right->devs[j]) return true;
+    }
+  }
+  return false;
+}
+
+static ncclResult_t occlIbValidateVDeviceMembers(const ncclNetVDeviceProps_t* props) {
+  if (props == NULL || props->ndevs <= 0 || props->ndevs > NCCL_IB_MAX_DEVS_PER_NIC) {
+    WARN("NET/IB : Invalid virtual device member count %d", props == NULL ? -1 : props->ndevs);
     return ncclInvalidUsage;
   }
-
-  if (props->ndevs == 0) {
-      WARN("NET/IB : Can't make virtual NIC with 0 devices");
+  for (int i = 0; i < props->ndevs; i++) {
+    if (props->devs[i] < 0 || props->devs[i] >= ncclNIbDevs) {
+      WARN("NET/IB : Cannot use physical device %d, physical count %d", props->devs[i], ncclNIbDevs);
       return ncclInvalidUsage;
+    }
+    for (int j = 0; j < i; j++) {
+      if (props->devs[j] == props->devs[i]) {
+        WARN("NET/IB : Cannot create a virtual device with duplicate physical device %d", props->devs[i]);
+        return ncclInvalidUsage;
+      }
+    }
   }
+  ncclIbDev* first = ncclIbDevs + props->devs[0];
+  for (int i = 1; i < props->ndevs; i++) {
+    ncclIbDev* member = ncclIbDevs + props->devs[i];
+    if (member->link != first->link) {
+      WARN("NET/IB : Attempted to merge incompatible devices: [%d]%s:%d/%s and [%d]%s:%d/%s. Try selecting NICs of only one link type using NCCL_IB_HCA",
+           props->devs[0], first->devName, first->portNum, NCCL_IB_LLSTR(first->link),
+           props->devs[i], member->devName, member->portNum, NCCL_IB_LLSTR(member->link));
+      return ncclInvalidUsage;
+    }
+  }
+  return ncclSuccess;
+}
 
-  if (ncclNMergedIbDevs == MAX_IB_VDEVS) {
+static ncclResult_t occlIbMakeLegacyVDevice(int* d, const ncclNetVDeviceProps_t* props) {
+  if (ncclNMergedIbDevs >= MAX_IB_VDEVS) {
     WARN("NET/IB : Cannot allocate any more virtual devices (%d)", MAX_IB_VDEVS);
     return ncclInvalidUsage;
   }
 
-  // Always count up number of merged devices
-  ncclIbMergedDev* mDev = ncclIbMergedDevs + ncclNMergedIbDevs;
-  mDev->vProps.ndevs = 0;
-  mDev->speed = 0;
-
+  ncclIbMergedDev staged = {};
+  staged.vProps = *props;
+  staged.publicVProps = *props;
+  staged.anchorDev = props->devs[0];
+  staged.firstAlias = ncclNMergedIbDevs;
+  staged.aliasCount = 1;
   for (int i = 0; i < props->ndevs; i++) {
-    ncclIbDev* dev = ncclIbDevs + props->devs[i];
-    if (mDev->vProps.ndevs == NCCL_IB_MAX_DEVS_PER_NIC) return ncclInvalidUsage;
-    mDev->vProps.devs[mDev->vProps.ndevs++] = props->devs[i];
-    mDev->speed += dev->speed;
-    // Each successive time, copy the name '+' new name
-    if (mDev->vProps.ndevs > 1) {
-      snprintf(mDev->devName + strlen(mDev->devName), sizeof(mDev->devName) - strlen(mDev->devName), "+%s", dev->devName);
-    // First time, copy the plain name
-    } else {
-      strncpy(mDev->devName, dev->devName, MAXNAMESIZE);
-    }
-  }
-
-  // Check link layers
-  ncclIbDev* dev0 = ncclIbDevs + props->devs[0];
-  for (int i = 1; i < props->ndevs; i++) {
-    if (props->devs[i] >= ncclNIbDevs) {
-      WARN("NET/IB : Cannot use physical device %d, max %d", props->devs[i], ncclNIbDevs);
-      return ncclInvalidUsage;
-    }
-    ncclIbDev* dev = ncclIbDevs + props->devs[i];
-    if (dev->link != dev0->link) {
-      WARN("NET/IB : Attempted to merge incompatible devices: [%d]%s:%d/%s and [%d]%s:%d/%s. Try selecting NICs of only one link type using NCCL_IB_HCA",
-        props->devs[0], dev0->devName, dev0->portNum, NCCL_IB_LLSTR(dev0->link), props->devs[i], dev->devName, dev->portNum, NCCL_IB_LLSTR(dev->link));
+    ncclIbDev* member = ncclIbDevs + props->devs[i];
+    staged.speed += member->speed;
+    size_t used = strlen(staged.devName);
+    int written = snprintf(staged.devName + used, sizeof(staged.devName) - used,
+                           "%s%s", i == 0 ? "" : "+", member->devName);
+    if (written < 0 || (size_t)written >= sizeof(staged.devName) - used) {
+      WARN("NET/IB : Virtual device name is too long");
       return ncclInvalidUsage;
     }
   }
 
-  *d = ncclNMergedIbDevs++;
-  INFO(NCCL_NET, "NET/IB : Made virtual device [%d] name=%s speed=%d ndevs=%d", *d, mDev->devName, mDev->speed, mDev->vProps.ndevs);
+  *d = ncclNMergedIbDevs;
+  ncclIbMergedDevs[ncclNMergedIbDevs++] = staged;
+  INFO(NCCL_NET, "NET/IB : Made virtual device [%d] name=%s speed=%d ndevs=%d", *d, staged.devName, staged.speed, staged.vProps.ndevs);
   return ncclSuccess;
+}
+
+static ncclResult_t occlIbMakeForcedAliases(int* d, const ncclNetVDeviceProps_t* props) {
+  for (int virtualDev = 0; virtualDev < ncclNMergedIbDevs; virtualDev++) {
+    const ncclIbMergedDev* existing = ncclIbMergedDevs + virtualDev;
+    if (!existing->isForcedAlias || existing->firstAlias != virtualDev) continue;
+    if (occlIbSameMemberSet(&existing->vProps, props)) {
+      *d = existing->firstAlias;
+      return ncclSuccess;
+    }
+    if (occlIbMemberSetsOverlap(&existing->vProps, props)) {
+      WARN("NET/IB : Forced merge overlaps existing alias group beginning at virtual device %d", existing->firstAlias);
+      return ncclInvalidUsage;
+    }
+  }
+
+  // pciPath already applies the multi-port/VF normalization used by the
+  // physical properties. Preserve up to two ports at that locality as the
+  // active unit; missing topology information must not join unrelated NICs.
+  ncclNetVDeviceProps_t activeGroups[NCCL_IB_MAX_DEVS_PER_NIC] = {};
+  bool assigned[NCCL_IB_MAX_DEVS_PER_NIC] = {};
+  int orderedMembers[NCCL_IB_MAX_DEVS_PER_NIC] = {};
+  int groupOffsets[NCCL_IB_MAX_DEVS_PER_NIC] = {};
+  int groupCount = 0;
+  int memberCount = 0;
+  for (int i = 0; i < props->ndevs; i++) {
+    if (assigned[i]) continue;
+    ncclNetVDeviceProps_t* active = &activeGroups[groupCount];
+    const int anchor = props->devs[i];
+    active->devs[active->ndevs++] = anchor;
+    assigned[i] = true;
+    const char* anchorPath = ncclIbDevs[anchor].pciPath;
+    if (anchorPath != NULL && anchorPath[0] != '\0') {
+      for (int j = i + 1; j < props->ndevs; j++) {
+        if (assigned[j]) continue;
+        const char* memberPath = ncclIbDevs[props->devs[j]].pciPath;
+        if (memberPath != NULL && memberPath[0] != '\0' && strcmp(anchorPath, memberPath) == 0) {
+          active->devs[active->ndevs++] = props->devs[j];
+          assigned[j] = true;
+          break;
+        }
+      }
+    }
+    groupOffsets[groupCount++] = memberCount;
+    for (int member = 0; member < active->ndevs; member++) {
+      orderedMembers[memberCount++] = active->devs[member];
+    }
+  }
+
+  if (ncclNMergedIbDevs > MAX_IB_VDEVS - groupCount) {
+    WARN("NET/IB : Cannot allocate %d forced-merge aliases, only %d virtual slots remain",
+         groupCount, MAX_IB_VDEVS - ncclNMergedIbDevs);
+    return ncclInvalidUsage;
+  }
+
+  const int firstAlias = ncclNMergedIbDevs;
+  ncclIbMergedDev staged[NCCL_IB_MAX_DEVS_PER_NIC] = {};
+  for (int alias = 0; alias < groupCount; alias++) {
+    const ncclNetVDeviceProps_t* active = &activeGroups[alias];
+    staged[alias].vProps.ndevs = props->ndevs;
+    for (int member = 0; member < props->ndevs; member++) {
+      staged[alias].vProps.devs[member] = orderedMembers[(groupOffsets[alias] + member) % memberCount];
+    }
+    staged[alias].publicVProps = *active;
+    staged[alias].anchorDev = active->devs[0];
+    staged[alias].firstAlias = firstAlias;
+    staged[alias].aliasCount = groupCount;
+    staged[alias].isForcedAlias = 1;
+    int64_t activeSpeed = 0;
+    for (int member = 0; member < active->ndevs; member++) {
+      const ncclIbDev* physical = &ncclIbDevs[active->devs[member]];
+      activeSpeed += physical->speed;
+      const size_t used = strlen(staged[alias].devName);
+      const int written = snprintf(staged[alias].devName + used, sizeof(staged[alias].devName) - used,
+                                   "%s%s", member == 0 ? "" : "+", physical->devName);
+      if (written < 0 || (size_t)written >= sizeof(staged[alias].devName) - used) {
+        WARN("NET/IB : Forced-merge alias name is too long");
+        return ncclInvalidUsage;
+      }
+    }
+    if (activeSpeed > std::numeric_limits<int>::max() || activeSpeed < std::numeric_limits<int>::min()) {
+      WARN("NET/IB : Forced-merge active speed exceeds the property limit");
+      return ncclInvalidUsage;
+    }
+    staged[alias].speed = (int)activeSpeed;
+  }
+
+  for (int alias = 0; alias < groupCount; alias++) {
+    ncclIbMergedDevs[firstAlias + alias] = staged[alias];
+  }
+  ncclNMergedIbDevs += groupCount;
+  *d = firstAlias;
+  INFO(NCCL_NET, "NET/IB : Made %d GPU-local aliases for forced merge beginning at virtual device %d", groupCount, firstAlias);
+  return ncclSuccess;
+}
+
+ncclResult_t ncclIbMakeVDeviceInternal(int* d, ncclNetVDeviceProps_t* props) {
+  if (d == NULL || props == NULL) return ncclInvalidArgument;
+  if (ncclParamIbMergeNics() == 0 && props->ndevs > 1) {
+    INFO(NCCL_NET, "NET/IB : Skipping makeVDevice, NCCL_IB_MERGE_NICS=0");
+    return ncclInvalidUsage;
+  }
+  NCCLCHECK(occlIbValidateVDeviceMembers(props));
+  if (props->ndevs > 1 && occlIbForceMergeAliasesEnabled()) {
+    return occlIbMakeForcedAliases(d, props);
+  }
+  return occlIbMakeLegacyVDevice(d, props);
 }
 
 ncclResult_t ncclIbMakeVDevice(int* d, ncclNetVDeviceProps_t* props) {
@@ -444,20 +596,43 @@ ncclResult_t ncclIbGetPhysProperties(int dev, ncclNetProperties_t* props) {
   props->maxP2pBytes = NCCL_MAX_NET_SIZE_BYTES;
   props->maxCollBytes = MAX_COLLNET_SIZE;
   props->maxMultiRequestSize = 1;
+  props->railId = NCCL_NET_ID_UNDEF;
+  props->planeId = NCCL_NET_ID_UNDEF;
   return ncclSuccess;
 }
 
 ncclResult_t ncclIbGetProperties(int dev, ncclNetProperties_t* props) {
-  if (dev >= ncclNMergedIbDevs) {
+  if (props == NULL) return ncclInvalidArgument;
+  if (dev < 0 || dev >= ncclNMergedIbDevs) {
     WARN("NET/IB : Requested properties for vNic %d, only %d vNics have been created", dev, ncclNMergedIbDevs);
     return ncclInvalidUsage;
   }
   struct ncclIbMergedDev* mergedDev = ncclIbMergedDevs + dev;
-  // Take the rest of the properties from an arbitrary sub-device (should be the same)
-  NCCLCHECK(ncclIbGetPhysProperties(mergedDev->vProps.devs[0], props));
-  props->name = mergedDev->devName;
-  props->speed = mergedDev->speed;
-  memcpy(&props->vProps, &mergedDev->vProps, sizeof(ncclNetVDeviceProps_t));
+  NCCLCHECK(ncclIbGetPhysProperties(mergedDev->anchorDev, props));
+  const bool pairedAlias = mergedDev->isForcedAlias && mergedDev->publicVProps.ndevs > 1;
+  if (!mergedDev->isForcedAlias || pairedAlias) {
+    props->name = mergedDev->devName;
+    props->speed = mergedDev->speed;
+  }
+  if (pairedAlias) {
+    // Registration covers private standby members too. Advertise only modes
+    // and limits that remain usable on every member, while topology/speed
+    // describe the active local pair alone.
+    for (int member = 0; member < mergedDev->vProps.ndevs; member++) {
+      if (mergedDev->vProps.devs[member] == mergedDev->anchorDev) continue;
+      ncclNetProperties_t memberProps = {};
+      NCCLCHECK(ncclIbGetPhysProperties(mergedDev->vProps.devs[member], &memberProps));
+      props->ptrSupport &= memberProps.ptrSupport;
+      props->regIsGlobal &= memberProps.regIsGlobal;
+      props->forceFlush |= memberProps.forceFlush;
+      props->maxComms = std::min(props->maxComms, memberProps.maxComms);
+      props->maxRecvs = std::min(props->maxRecvs, memberProps.maxRecvs);
+      props->maxP2pBytes = std::min(props->maxP2pBytes, memberProps.maxP2pBytes);
+      props->maxCollBytes = std::min(props->maxCollBytes, memberProps.maxCollBytes);
+      props->maxMultiRequestSize = std::min(props->maxMultiRequestSize, memberProps.maxMultiRequestSize);
+    }
+  }
+  memcpy(&props->vProps, &mergedDev->publicVProps, sizeof(ncclNetVDeviceProps_t));
   return ncclSuccess;
 }
 

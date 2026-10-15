@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/Apache-2.0.txt for more license information
  *************************************************************************/
 
 #include <sys/types.h>
@@ -82,12 +82,17 @@ ncclResult_t buildIbvSymbols(struct ncclIbvSymbols* ibvSymbols) {
   void* tmp;
   void** cast;
 
-  ibvhandle=dlopen("libibverbs.so", RTLD_NOW);
+  // Reuse an already-loaded runtime SONAME in this link-map. Otherwise,
+  // preserve the existing load preference.
+  ibvhandle=dlopen("libibverbs.so.1", RTLD_NOW | RTLD_NOLOAD);
   if (!ibvhandle) {
-    ibvhandle=dlopen("libibverbs.so.1", RTLD_NOW);
+    ibvhandle=dlopen("libibverbs.so", RTLD_NOW);
     if (!ibvhandle) {
-      INFO(NCCL_INIT, "Failed to open libibverbs.so[.1]");
-      goto teardown;
+      ibvhandle=dlopen("libibverbs.so.1", RTLD_NOW);
+      if (!ibvhandle) {
+        INFO(NCCL_INIT, "Failed to open libibverbs.so[.1]");
+        goto teardown;
+      }
     }
   }
 

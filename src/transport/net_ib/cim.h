@@ -1,3 +1,11 @@
+/*************************************************************************
+ * Copyright (c) 2026 Oracle and/or its affiliates.
+ * SPDX-License-Identifier: UPL-1.0
+ *
+ * Licensed under the Universal Permissive License (UPL), Version 1.0.
+ * See LICENSE.txt.
+ *************************************************************************/
+
 #ifndef _CIM_H_
 #define _CIM_H_
 

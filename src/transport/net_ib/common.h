@@ -1,8 +1,15 @@
 /*************************************************************************
+ * Copyright (c) 2026 Oracle and/or its affiliates.
+ * Modifications by Oracle and/or its affiliates are licensed under the
+ * Universal Permissive License (UPL), Version 1.0. See LICENSE.txt.
+ * Modified by Oracle and/or its affiliates on 2026-03-06.
+ *************************************************************************/
+
+/*************************************************************************
  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/Apache-2.0.txt for more license information
  *************************************************************************/
 
 #ifndef NET_IB_COMMON_H_
@@ -68,10 +75,18 @@ struct ncclIbMrCache {
 };
 
 extern int ncclNMergedIbDevs;
-#define NCCL_IB_MAX_DEVS_PER_NIC 4
+#define NCCL_IB_MAX_DEVS_PER_NIC NCCL_NET_MAX_DEVS_PER_NIC
 #define MAX_MERGED_DEV_NAME (MAXNAMESIZE*NCCL_IB_MAX_DEVS_PER_NIC)+NCCL_IB_MAX_DEVS_PER_NIC
 struct alignas(64) ncclIbMergedDev {
+  // Private active-group-first members used by connection setup, registration,
+  // and failover. Forced aliases expose only their PCI-local active group
+  // (one or two ports) in the public view below, retaining other paths privately.
   ncclNetVDeviceProps_t vProps;
+  ncclNetVDeviceProps_t publicVProps;
+  int anchorDev;
+  int firstAlias;
+  int aliasCount;
+  int isForcedAlias;
   int speed;
   char devName[MAX_MERGED_DEV_NAME]; // Up to NCCL_IB_MAX_DEVS_PER_NIC * name size, and a character for each '+'
 };
@@ -155,7 +170,10 @@ struct ncclIbGidInfo {
   int32_t localGidIndex;
 };
 
-#define MAX_QPS_PER_REQ 8
+// Maximal number of QPs a communicator can have for data transfers
+#define NCCL_IB_MAX_QPS 128
+
+#define MAX_QPS_PER_REQ NCCL_IB_MAX_QPS
 struct ncclProfilerInfo {
   void* qpEventHandles[MAX_QPS_PER_REQ];
   int qpIndex[MAX_QPS_PER_REQ];
@@ -172,9 +190,6 @@ struct ncclProfilerInfo {
 #define NCCL_NET_IB_REQ_FLUSH 3
 #define NCCL_NET_IB_REQ_GIN_IPUT 4
 extern const char* ncclIbReqTypeStr[];
-
-// Maximal number of QPs a communicator can have for data transfers
-#define NCCL_IB_MAX_QPS 128
 
 // Tracks data transfers between sender and receiver. A multi-recv/send uses a
 // single record.
@@ -212,10 +227,10 @@ struct ncclIbRequestSendState {
   // Number of receiver completions already credited per physical QP.
   uint16_t ackedCompletions[NCCL_IB_MAX_QPS];
 };
-static_assert(offsetof(struct ncclIbRequestSendState, pendingData) == 40, "ncclIbRequestSendState::pendingData offset changed");
-static_assert(offsetof(struct ncclIbRequestSendState, lastAttemptQpIndex) == 168, "ncclIbRequestSendState::lastAttemptQpIndex offset changed");
-static_assert(offsetof(struct ncclIbRequestSendState, lastAttemptOrder) == 680, "ncclIbRequestSendState::lastAttemptOrder offset changed");
-static_assert(offsetof(struct ncclIbRequestSendState, ackedCompletions) == 808, "ncclIbRequestSendState::ackedCompletions offset changed");
+static_assert(offsetof(struct ncclIbRequestSendState, pendingData) == 56, "ncclIbRequestSendState::pendingData offset changed");
+static_assert(offsetof(struct ncclIbRequestSendState, lastAttemptQpIndex) == 184, "ncclIbRequestSendState::lastAttemptQpIndex offset changed");
+static_assert(offsetof(struct ncclIbRequestSendState, lastAttemptOrder) == 696, "ncclIbRequestSendState::lastAttemptOrder offset changed");
+static_assert(offsetof(struct ncclIbRequestSendState, ackedCompletions) == 824, "ncclIbRequestSendState::ackedCompletions offset changed");
 
 struct ncclIbRequestRecvState {
   struct ncclIbRequestCompletionRecord* cmplsRecords;
@@ -262,11 +277,11 @@ struct alignas(64) ncclIbRequest {
 static_assert(alignof(struct ncclIbRequest) == 64, "ncclIbRequest must be 64-byte aligned");
 static_assert((sizeof(struct ncclIbRequest) % 64) == 0, "ncclIbRequest size must be a 64-byte multiple");
 #ifndef NCCL_ENABLE_NET_PROFILING
-static_assert(sizeof(struct ncclIbRequest) == 1152, "ncclIbRequest should stay trimmed to 1152B without profiling");
-static_assert(offsetof(struct ncclIbRequest, connectionId) == 84, "ncclIbRequest::connectionId should consume the header pad");
-static_assert(offsetof(struct ncclIbRequest, send) == 88, "ncclIbRequest::send offset changed");
-static_assert((offsetof(struct ncclIbRequest, send) + offsetof(struct ncclIbRequestSendState, pendingData)) == 128, "ncclIbRequest::send.pendingData should stay on the 128B boundary");
-static_assert((offsetof(struct ncclIbRequest, send) + offsetof(struct ncclIbRequestSendState, lastAttemptQpIndex)) == 256, "ncclIbRequest::send.lastAttemptQpIndex should stay 256B from the request base");
+static_assert(sizeof(struct ncclIbRequest) == 1216, "ncclIbRequest should stay trimmed to 1216B without profiling");
+static_assert(offsetof(struct ncclIbRequest, connectionId) == 132, "ncclIbRequest::connectionId should consume the header pad");
+static_assert(offsetof(struct ncclIbRequest, send) == 136, "ncclIbRequest::send offset changed");
+static_assert((offsetof(struct ncclIbRequest, send) + offsetof(struct ncclIbRequestSendState, pendingData)) == 192, "ncclIbRequest::send.pendingData should stay on a cache-line boundary");
+static_assert((offsetof(struct ncclIbRequest, send) + offsetof(struct ncclIbRequestSendState, lastAttemptQpIndex)) == 320, "ncclIbRequest::send.lastAttemptQpIndex offset changed");
 #endif
 
 struct alignas(64) ncclIbNetCommDevBase {
@@ -286,7 +301,6 @@ struct ncclIbSendFifo {
   uint32_t nreqs;
   uint32_t tag;
   uint64_t idx;
-  char padding[16];
 };
 
 #define QP_SIG_RING NCCL_NET_IB_MAX_RECVS
@@ -320,6 +334,8 @@ struct alignas(128) ncclIbQp {
   // Data QPs use this 8-bit slot to reach their cold rejoin metadata in
   // ncclIbNetCommBase::qpCold[]. Standalone probing/flush QPs leave it invalid.
   uint8_t coldIdx;
+  // Stable request/FRM lane carried by this primary or standby physical QP.
+  uint8_t logicalLane;
 };
 static_assert(alignof(struct ncclIbQp) == 128, "ncclIbQp must be 128-byte aligned");
 static_assert(sizeof(struct ncclIbQp) == 128, "ncclIbQp hot shell should fit exactly in one 128-byte region");
@@ -327,6 +343,7 @@ static_assert(offsetof(struct ncclIbQp, qp) == 0, "ncclIbQp::qp offset changed")
 static_assert(offsetof(struct ncclIbQp, sig_tsc) == 24, "ncclIbQp::sig_tsc should stay in the first 128B region");
 static_assert(offsetof(struct ncclIbQp, sig_bytes) == 88, "ncclIbQp::sig_bytes should stay in the first 128B region");
 static_assert(offsetof(struct ncclIbQp, coldIdx) == 120, "ncclIbQp::coldIdx should stay in the first 128B region");
+static_assert(offsetof(struct ncclIbQp, logicalLane) == 121, "ncclIbQp::logicalLane should use existing tail padding");
 
 // We need to support NCCL_NET_MAX_REQUESTS for each concurrent receive
 #define NET_IB_MAX_REQUESTS (NCCL_NET_MAX_REQUESTS*NCCL_NET_IB_MAX_RECVS)
@@ -418,8 +435,15 @@ struct alignas(128) ncclIbNetCommBase {
   struct ncclIbRequest reqs[NET_IB_MAX_REQUESTS];
   struct ncclIbQp qps[NCCL_IB_MAX_QPS];
   uint64_t fifoHead;
+  // Logical request/FRM lanes. This retains the existing nqps meaning.
   int nqps;
+  // Split-disabled logical active-window width.
+  int nDataQps;
+  // Primary plus warm-standby QPs materialized in qps[].
+  int nPhysicalQps;
   int splitDataOnQps;
+  // Immutable after connection geometry is configured.
+  bool hasStandbyPaths;
   struct ncclSocket sock;
   int ready;
   // Track necessary remDevInfo here
@@ -427,7 +451,6 @@ struct alignas(128) ncclIbNetCommBase {
   struct ncclIbDevInfo remDevs[NCCL_IB_MAX_DEVS_PER_NIC];
   // statistics about the comm
   struct ncclIbStats stats;
-  int nDataQps;
   struct ncclIbNetCommFrmFields frmFields;
   // Array of pointers to the "actual" QPs that are used for data transfers.
   // The pointers point to QPs in the ncclIbNetCommBase::qps[] array and may be
@@ -444,6 +467,9 @@ struct alignas(128) ncclIbNetCommBase {
   struct ncclIbQpColdFields qpCold[NCCL_IB_MAX_QPS];
 };
 static_assert(alignof(struct ncclIbNetCommBase) == 128, "ncclIbNetCommBase must be 128-byte aligned");
+static_assert((offsetof(struct ncclIbNetCommBase, nqps) / 64) ==
+              (offsetof(struct ncclIbNetCommBase, hasStandbyPaths) / 64),
+              "ncclIbNetCommBase::nqps, nDataQps, nPhysicalQps, splitDataOnQps, and hasStandbyPaths must share a cache line");
 static_assert(offsetof(struct ncclIbNetCommBase, reqs) < offsetof(struct ncclIbNetCommBase, frmFields), "reqs should stay ahead of frmFields");
 static_assert(offsetof(struct ncclIbNetCommBase, qps) < offsetof(struct ncclIbNetCommBase, frmFields), "qps should stay ahead of frmFields");
 static_assert(offsetof(struct ncclIbNetCommBase, remDevs) < offsetof(struct ncclIbNetCommBase, frmFields), "remDevs should stay ahead of frmFields");
@@ -459,6 +485,19 @@ static inline struct ncclIbQpColdFields* ncclIbCommBaseGetQpCold(struct ncclIbNe
   assert(qp != NULL);
   assert(qp->coldIdx != NCCL_IB_QP_COLD_INVALID);
   return &commBase->qpCold[qp->coldIdx];
+}
+
+static inline int occlIbCommPhysicalQpCount(const struct ncclIbNetCommBase* base) {
+  assert(base != NULL);
+  return base->nPhysicalQps > 0 ? base->nPhysicalQps : (base->nqps > 0 ? base->nqps : 0);
+}
+
+static inline int occlIbCommPhysicalQpIndex(const struct ncclIbNetCommBase* base, int logicalLane, int path) {
+  assert(base != NULL);
+  assert(logicalLane >= 0 && logicalLane < base->nqps);
+  int physicalQpIndex = path * base->nqps + logicalLane;
+  assert(physicalQpIndex >= 0 && physicalQpIndex < occlIbCommPhysicalQpCount(base));
+  return physicalQpIndex;
 }
 
 // qpIndex is the index relative to a device.
@@ -490,7 +529,8 @@ static inline ncclResult_t ncclIbCommBaseGetQpByQpNum(struct ncclIbNetCommBase* 
   assert(devIndex >= 0 && devIndex < commBase->vProps.ndevs);
   assert(qp != NULL);
   int hashedQpIndex = qpMapFind(&commBase->frmFields.completion.qpHash, qpNum);
-  if ((unsigned)hashedQpIndex < (unsigned)commBase->nqps) {
+  const int physicalQps = occlIbCommPhysicalQpCount(commBase);
+  if ((unsigned)hashedQpIndex < (unsigned)physicalQps) {
     ncclIbQp* hashedQp = &commBase->qps[hashedQpIndex];
     if (hashedQp->qp != NULL && hashedQp->devIndex == devIndex && hashedQp->qp->qp_num == qpNum) {
       *qp = hashedQp;
@@ -498,12 +538,12 @@ static inline ncclResult_t ncclIbCommBaseGetQpByQpNum(struct ncclIbNetCommBase* 
       return ncclSuccess;
     }
   }
-  TRACE(NCCL_NET, "NET/IB: %s: Looking for QP num %u on devIndex %d among %d QPs", __func__, qpNum, devIndex, commBase->nqps / commBase->vProps.ndevs);
-  for (int qpIndexInDev = 0; qpIndexInDev < (commBase->nqps / commBase->vProps.ndevs); qpIndexInDev++) {
-    *qp = &(commBase->qps[commBase->vProps.ndevs*qpIndexInDev + devIndex]);
-    if ((*qp)->qp->qp_num == qpNum) {
+  TRACE(NCCL_NET, "NET/IB: %s: Looking for QP num %u on devIndex %d among %d physical QPs", __func__, qpNum, devIndex, physicalQps);
+  for (int physicalQpIndex = 0; physicalQpIndex < physicalQps; physicalQpIndex++) {
+    *qp = &commBase->qps[physicalQpIndex];
+    if ((*qp)->qp != NULL && (*qp)->devIndex == devIndex && (*qp)->qp->qp_num == qpNum) {
       if (qpIndex != NULL) {
-        *qpIndex = *qp - commBase->qps;
+        *qpIndex = physicalQpIndex;
       }
       return ncclSuccess;
     }
@@ -512,9 +552,9 @@ static inline ncclResult_t ncclIbCommBaseGetQpByQpNum(struct ncclIbNetCommBase* 
   return ncclInternalError;
 }
 
-// Each request is transfered over all devices, and depending on the
-// "splitDataOnQps" configuration parameter, a request may be transffered over
-// a single QP per device or on all QPs of each device.
+// Split-disabled requests use one rotating logical lane per active port;
+// split-enabled requests use every logical lane. Private standby QPs are
+// selected only through activeQps remapping, not counted in either width.
 static inline int ncclIbCommBaseGetNqpsPerRequest(struct ncclIbNetCommBase* baseComm) {
   assert(baseComm->nDataQps != -1);
   assert(baseComm->nqps != -1);
@@ -552,6 +592,10 @@ struct alignas(64) ncclIbMultiSendScratch {
 #if FRM_DEBUG
   uint32_t* sendSzPerPost;
 #endif
+  // Optional replay ownership state for resilient FRM communicators.
+  // Both arrays are appended to storage so teardown retains a single free.
+  uint32_t* replayPlanBytes;
+  uint8_t* replayPlanFrozen;
 };
 static_assert(alignof(struct ncclIbMultiSendScratch) == 64, "ncclIbMultiSendScratch must be 64-byte aligned");
 static_assert((sizeof(struct ncclIbMultiSendScratch) % 64) == 0, "ncclIbMultiSendScratch size must be a 64-byte multiple");
@@ -607,6 +651,14 @@ static inline struct ibv_send_wr* ncclIbMultiSendScratchWrRow(struct ncclIbMulti
 
 static inline struct ibv_sge* ncclIbMultiSendScratchSgeRow(struct ncclIbMultiSendScratch* scratch, int qpSlot) {
   return (struct ibv_sge*)((char*)scratch->sgesPerPost + (size_t)qpSlot * (size_t)scratch->sgeRowBytes);
+}
+
+static inline uint32_t* occlIbMultiSendScratchReplayPlanRow(struct ncclIbMultiSendScratch* scratch, int requestIndex) {
+  assert(scratch != NULL);
+  assert(scratch->replayPlanBytes != NULL);
+  assert(scratch->nqps > 0);
+  assert(requestIndex >= 0 && requestIndex < NET_IB_MAX_REQUESTS);
+  return scratch->replayPlanBytes + (size_t)requestIndex * (size_t)scratch->nqps;
 }
 
 #if FRM_DEBUG
@@ -811,7 +863,7 @@ static inline void qpMapBuild(ncclIbNetCommBase* base) {
   fprintf(stdout,"Building qmap\n");
   fflush(stdout);
 #endif
-  for (int i = 0; i < base->nqps; i++) {
+  for (int i = 0; i < occlIbCommPhysicalQpCount(base); i++) {
     if (base->qps[i].qp == NULL) continue;
     uint32_t qp_num = base->qps[i].qp->qp_num;
     qpMapInsert(&base->frmFields.completion.qpHash, qp_num, (uint16_t)i);

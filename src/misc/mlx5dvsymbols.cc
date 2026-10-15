@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/Apache-2.0.txt for more license information
  *************************************************************************/
 
 #include <sys/types.h>
@@ -36,12 +36,17 @@ ncclResult_t buildMlx5dvSymbols(struct ncclMlx5dvSymbols* mlx5dvSymbols) {
   void* tmp;
   void** cast;
 
-  mlx5dvhandle=dlopen("libmlx5.so", RTLD_NOW);
+  // Reuse an already-loaded runtime SONAME in this link-map. Otherwise,
+  // preserve the existing load preference.
+  mlx5dvhandle=dlopen("libmlx5.so.1", RTLD_NOW | RTLD_NOLOAD);
   if (!mlx5dvhandle) {
-    mlx5dvhandle=dlopen("libmlx5.so.1", RTLD_NOW);
+    mlx5dvhandle=dlopen("libmlx5.so", RTLD_NOW);
     if (!mlx5dvhandle) {
-      INFO(NCCL_INIT, "Failed to open libmlx5.so[.1]");
-      goto teardown;
+      mlx5dvhandle=dlopen("libmlx5.so.1", RTLD_NOW);
+      if (!mlx5dvhandle) {
+        INFO(NCCL_INIT, "Failed to open libmlx5.so[.1]");
+        goto teardown;
+      }
     }
   }
 

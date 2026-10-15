@@ -1,8 +1,15 @@
 /*************************************************************************
+ * Copyright (c) 2026 Oracle and/or its affiliates.
+ * Modifications by Oracle and/or its affiliates are licensed under the
+ * Universal Permissive License (UPL), Version 1.0. See LICENSE.txt.
+ * Modified by Oracle and/or its affiliates on 2026-03-06.
+ *************************************************************************/
+
+/*************************************************************************
  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/Apache-2.0.txt for more license information
  *************************************************************************/
 
 #ifndef NET_IB_P2P_H_
@@ -61,10 +68,15 @@ static inline struct ncclIbRequest* ibRecvReqFind(struct ncclIbRecvComm* recvCom
 }
 
 static inline ncclResult_t ncclIbRecvCommGetQpForCts(struct ncclIbRecvComm* recvComm, uint32_t id, ncclIbQp** qp) {
-  int devIndex = id % recvComm->base.vProps.ndevs;
-  // CTS message is always posted the first QP on the device
-  int qpIndex = 0;
-  ncclIbCommBaseGetQpByIndex(&recvComm->base, devIndex, qpIndex, qp);
+  if (recvComm->base.hasStandbyPaths) {
+    int logicalLane = -1;
+    NCCLCHECK(ncclIbCommBaseGetQpForRequest(&recvComm->base, id, 0, qp, &logicalLane));
+  } else {
+    int devIndex = id % recvComm->base.vProps.ndevs;
+    // Direct geometry retains the legacy device rotation and uses the first
+    // QP on the selected device.
+    NCCLCHECK(ncclIbCommBaseGetQpByIndex(&recvComm->base, devIndex, 0, qp));
+  }
   assert(*qp != NULL);
   return ncclSuccess;
 }

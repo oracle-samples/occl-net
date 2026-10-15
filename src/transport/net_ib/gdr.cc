@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/Apache-2.0.txt for more license information
  *************************************************************************/
 
 #include "common.h"
@@ -48,9 +48,7 @@ static void ibDmaBufSupportInitOnce() {
   ncclResult_t res;
   int dev_fail = 0;
 
-  // This is a physical device, not a virtual one, so select from ibDevs
-  ncclIbMergedDev* mergedDev = ncclIbMergedDevs + ibDmaSupportInitDev;
-  ncclIbDev* ibDev = ncclIbDevs + mergedDev->vProps.devs[0];
+  ncclIbDev* ibDev = ncclIbDevs + ibDmaSupportInitDev;
   struct ibv_pd* pd;
   struct ibv_context* ctx = ibDev->context;
   NCCLCHECKGOTO(wrap_ibv_alloc_pd(&pd, ctx), res, failure);
@@ -73,11 +71,11 @@ failure:
 // ncclSystemError : DMA-BUF is not supported by the kernel
 ncclResult_t ncclIbDmaBufSupport(int dev) {
   static std::once_flag onces[MAX_IB_DEVS];
+  if (dev < 0 || dev >= ncclNIbDevs) return ncclSystemError;
   // init the device only once
   ibDmaSupportInitDev = dev;
   std::call_once(onces[dev], ibDmaBufSupportInitOnce);
-  ncclIbMergedDev* mergedDev = ncclIbMergedDevs + ibDmaSupportInitDev;
-  ncclIbDev* ibDev = ncclIbDevs + mergedDev->vProps.devs[0];
+  ncclIbDev* ibDev = ncclIbDevs + ibDmaSupportInitDev;
   int dmaBufSupported = ibDev->dmaBufSupported;
   if (dmaBufSupported == 1) return ncclSuccess;
   return ncclSystemError;

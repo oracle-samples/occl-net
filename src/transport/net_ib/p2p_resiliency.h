@@ -1,8 +1,15 @@
 /*************************************************************************
+ * Copyright (c) 2026 Oracle and/or its affiliates.
+ * Modifications by Oracle and/or its affiliates are licensed under the
+ * Universal Permissive License (UPL), Version 1.0. See LICENSE.txt.
+ * Modified by Oracle and/or its affiliates on 2026-03-06.
+ *************************************************************************/
+
+/*************************************************************************
  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/Apache-2.0.txt for more license information
  *************************************************************************/
 
 #ifndef NET_IB_P2P_RESILIENCY_H_
@@ -80,16 +87,14 @@ struct alignas(128) ncclIbResiliency {
   int ndevs;
 
   // QPs used for probing of data transfers in case of QP/device failures.
-  // Note that the receiver and sender might have different number of devices
-  // (asymmetric device configuration), so the number of probing QPs might be
-  // configured differently on the receiver and sender and might be even larger
-  // than the number of local devices. In case that the number of probing QPs
-  // is larger than the number of local devices, some of these QPs are only
-  // created to allow the remote side to connect to them and issue RDMA Read
-  // operations through them but no local operations are performed on these
-  // QPs.
+  // Both peers create max(local devices, remote devices) probing paths so their
+  // path indices agree for asymmetric groups. Paths are placed modulo the local
+  // device count, which leaves equal-width configurations unchanged.
   struct ncclIbQp probingQps[NCCL_IB_MAX_DEVS_PER_NIC];
   int nProbingQps;
+  // Failed auxiliary RC QPs cannot self-heal. Keep them quarantined for this
+  // communicator without changing the associated data-device state.
+  uint64_t failedProbeQpMask;
 
   // As long as this variable is true, it means that resiliency operations are
   // in progress.

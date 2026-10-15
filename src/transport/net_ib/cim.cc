@@ -1,3 +1,11 @@
+/*************************************************************************
+ * Copyright (c) 2026 Oracle and/or its affiliates.
+ * SPDX-License-Identifier: UPL-1.0
+ *
+ * Licensed under the Universal Permissive License (UPL), Version 1.0.
+ * See LICENSE.txt.
+ *************************************************************************/
+
 #define ENABLE_TIMER 1           // MUST be before including timer.h
 #define CIM_DEBUG 0              // set to 1 only if you want lw dumps (will add noise)
 

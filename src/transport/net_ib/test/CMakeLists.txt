@@ -1,13 +1,8 @@
-# Copyright (c) 2026 OCCL-net.
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-# http://www.apache.org/licenses/LICENSE-2.0
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 Oracle and/or its affiliates.
+# SPDX-License-Identifier: UPL-1.0
+#
+# Licensed under the Universal Permissive License (UPL), Version 1.0.
+# See LICENSE.txt.
 
 if(OCCL_NET_IB_ENABLE_TESTS)
     set(NET_IB_SOURCE_TEST_TARGETS)
@@ -17,10 +12,33 @@ if(OCCL_NET_IB_ENABLE_TESTS)
         string(REGEX REPLACE "_test$" "" source_stem "${test_stem}")
         set(target_name "net_ib_${source_stem}_tests")
 
-        add_executable(${target_name}
-            ${test_source}
-            test_support.cc
-        )
+        # These tests include and isolate their production source without the
+        # common doubles provided by test_support.cc.
+        if(source_stem STREQUAL "debug" OR
+           source_stem STREQUAL "linux" OR
+           source_stem STREQUAL "net_ib_plugin_stubs" OR
+           source_stem STREQUAL "param")
+            add_executable(${target_name} ${test_source})
+        else()
+            add_executable(${target_name}
+                ${test_source}
+                test_support.cc
+            )
+        endif()
+
+        # Disable CUDA-runtime dependencies for tests whose code paths do not require them.
+        if(source_stem STREQUAL "checks" OR
+           source_stem STREQUAL "debug" OR
+           source_stem STREQUAL "linux" OR
+           source_stem STREQUAL "utils")
+            target_compile_definitions(${target_name} PRIVATE OCCL_DISABLE_CUDA_RUNTIME=1)
+        endif()
+
+        # Let ibvwrap_test use libibverbs completion-status text instead of the
+        # deterministic formatter from test_support.cc.
+        if(source_stem STREQUAL "ibvwrap")
+            target_compile_definitions(${target_name} PRIVATE OCCL_TEST_USE_PRODUCTION_IBV_TEXT=1)
+        endif()
 
         target_include_directories(${target_name}
             PRIVATE
@@ -42,6 +60,7 @@ if(OCCL_NET_IB_ENABLE_TESTS)
                 GTest::gtest_main
                 Threads::Threads
                 CUDA::cudart
+                # Link the platform library required by dynamic-loader calls.
                 ${CMAKE_DL_LIBS}
         )
 
@@ -87,6 +106,15 @@ if(OCCL_NET_IB_ENABLE_TESTS)
 
     add_custom_target(net_ib_unit_tests
         DEPENDS ${NET_IB_SOURCE_TEST_TARGETS}
+    )
+
+    # Register the reporter's Python regression suite alongside the C++ unit tests.
+    # Suppress bytecode so importing the reporter does not dirty the source tree.
+    add_test(NAME net_ib.report_unit_function_coverage
+        COMMAND "${CMAKE_COMMAND}" -E env
+            "PYTHONDONTWRITEBYTECODE=1"
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/scripts/tests/test_report_unit_function_coverage.py"
     )
 endif()
 

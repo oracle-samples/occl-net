@@ -1,8 +1,15 @@
 /*************************************************************************
+ * Copyright (c) 2026 Oracle and/or its affiliates.
+ * Modifications by Oracle and/or its affiliates are licensed under the
+ * Universal Permissive License (UPL), Version 1.0. See LICENSE.txt.
+ * Modified by Oracle and/or its affiliates on 2026-03-06.
+ *************************************************************************/
+
+/*************************************************************************
  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/Apache-2.0.txt for more license information
  *************************************************************************/
 
 #include "connect.h"
@@ -66,6 +73,7 @@ struct ncclIbCommStage {
   int offset;
   void* buffer;
   void* comm;
+  bool deviceResourcesStarted;
 };
 
 struct ncclIbHandle {
@@ -75,6 +83,162 @@ struct ncclIbHandle {
 };
 
 NCCL_PARAM(IbQpsPerConn, "IB_QPS_PER_CONNECTION", 1);
+
+static constexpr uint64_t occlIbForcedSocketMagic = 0x4f43434c464d0002ULL;
+static constexpr uint32_t occlIbGeometryMagic = 0x4f43464d;
+static constexpr uint32_t occlIbGeometryVersion = 2;
+
+static ncclResult_t occlIbCheckPeerMode(bool forcedAlias, uint64_t magic) {
+  if (magic != (forcedAlias ? occlIbForcedSocketMagic : NCCL_SOCKET_MAGIC)) {
+    WARN("NET/IB: Incompatible force-merge connection protocol or mode; both peers must use the same plugin version and force-merge mode");
+    return ncclInvalidUsage;
+  }
+  return ncclSuccess;
+}
+
+static int occlIbDeviceListSize(bool forcedAlias) {
+  return forcedAlias ? sizeof(occlIbGeometryOffer) : sizeof(ncclNetVDeviceProps_t);
+}
+
+static ncclResult_t occlIbPrepareDeviceList(const ncclIbMergedDev* dev, void* buffer) {
+  if (!dev->isForcedAlias) {
+    memcpy(buffer, &dev->vProps, sizeof(dev->vProps));
+    return ncclSuccess;
+  }
+  if (ncclParamIbQpsPerConn() <= 0 || ncclParamIbQpsPerConn() > NCCL_IB_MAX_QPS ||
+      dev->publicVProps.ndevs < 1 || dev->publicVProps.ndevs > dev->vProps.ndevs) {
+    WARN("NET/IB: Invalid local force-merge QP count or public active width");
+    return ncclInvalidArgument;
+  }
+  occlIbGeometryOffer offer = {};
+  offer.magic = htonl(occlIbGeometryMagic);
+  offer.version = htonl(occlIbGeometryVersion);
+  offer.qpsPerConnection = htonl(ncclParamIbQpsPerConn());
+  offer.activeWidth = htonl(std::min(dev->publicVProps.ndevs, 2));
+  offer.privateProps = dev->vProps;
+  memcpy(buffer, &offer, sizeof(offer));
+  return ncclSuccess;
+}
+
+static ncclResult_t occlIbReceiveDeviceList(ncclSocket* sock, bool forcedAlias, void* buffer, int* offset) {
+  if (forcedAlias && *offset < sizeof(uint32_t)) {
+    NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, sock, buffer, sizeof(uint32_t), offset));
+    if (*offset < sizeof(uint32_t)) return ncclSuccess;
+  }
+  if (forcedAlias) {
+    uint32_t prefix;
+    memcpy(&prefix, buffer, sizeof(prefix));
+    if (ntohl(prefix) != occlIbGeometryMagic) {
+      WARN("NET/IB: Incompatible legacy force-merge peer; versioned geometry negotiation is required");
+      return ncclInvalidUsage;
+    }
+  }
+  return ncclSocketProgress(NCCL_SOCKET_RECV, sock, buffer, occlIbDeviceListSize(forcedAlias), offset);
+}
+
+static ncclResult_t occlIbParseDeviceList(bool forcedAlias, const void* buffer,
+                                         ncclNetVDeviceProps_t* remoteProps, int* remoteWidth) {
+  *remoteWidth = 1;
+  if (forcedAlias) {
+    occlIbGeometryOffer offer;
+    memcpy(&offer, buffer, sizeof(offer));
+    const uint32_t peerQps = ntohl(offer.qpsPerConnection);
+    const uint32_t peerWidth = ntohl(offer.activeWidth);
+    if (ntohl(offer.magic) != occlIbGeometryMagic || ntohl(offer.version) != occlIbGeometryVersion ||
+        peerQps == 0 || peerQps > NCCL_IB_MAX_QPS || peerQps != ncclParamIbQpsPerConn() ||
+        peerWidth < 1 || peerWidth > 2 || peerWidth > offer.privateProps.ndevs) {
+      WARN("NET/IB: Invalid or incompatible force-merge geometry offer: version=%u peerQps=%u localQps=%ld activeWidth=%u privateDevices=%d",
+           ntohl(offer.version), peerQps, ncclParamIbQpsPerConn(), peerWidth, offer.privateProps.ndevs);
+      return ncclInvalidUsage;
+    }
+    *remoteProps = offer.privateProps;
+    *remoteWidth = peerWidth;
+  } else {
+    memcpy(remoteProps, buffer, sizeof(*remoteProps));
+  }
+  if (remoteProps->ndevs <= 0 || remoteProps->ndevs > NCCL_IB_MAX_DEVS_PER_NIC) {
+    WARN("NET/IB: Invalid peer private device count %d", remoteProps->ndevs);
+    return ncclInvalidArgument;
+  }
+  if (forcedAlias) {
+    for (int i = 0; i < remoteProps->ndevs; i++) {
+      if (remoteProps->devs[i] < 0 || remoteProps->devs[i] >= MAX_IB_DEVS) return ncclInvalidArgument;
+      for (int j = 0; j < i; j++) {
+        if (remoteProps->devs[i] == remoteProps->devs[j]) return ncclInvalidArgument;
+      }
+    }
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t occlIbConfigureQpGeometry(struct ncclIbNetCommBase* base, bool forcedAlias,
+                                             int remoteDevices, int localWidth = 1, int remoteWidth = 1) {
+  if (base == NULL || base->vProps.ndevs <= 0 || remoteDevices <= 0 ||
+      base->vProps.ndevs > NCCL_IB_MAX_DEVS_PER_NIC || remoteDevices > NCCL_IB_MAX_DEVS_PER_NIC) {
+    WARN("NET/IB: Invalid local/remote device counts while configuring QPs");
+    return ncclInvalidArgument;
+  }
+
+  const int64_t qpsPerConnection = ncclParamIbQpsPerConn();
+  const int paths = std::max(base->vProps.ndevs, remoteDevices);
+  if (qpsPerConnection <= 0 || qpsPerConnection > NCCL_IB_MAX_QPS / paths) {
+    WARN("NET/IB: Requested QP geometry exceeds the %d-QP connection limit: qpsPerConnection=%ld paths=%d",
+         NCCL_IB_MAX_QPS, qpsPerConnection, paths);
+    return ncclInvalidArgument;
+  }
+
+  int activeWidth = 1;
+  if (forcedAlias) {
+    if (base->vProps.ndevs < 2 || remoteDevices < 2) {
+      WARN("NET/IB: Forced-alias geometry requires at least two private devices on each peer");
+      return ncclInternalError;
+    }
+    if (localWidth < 1 || localWidth > 2 || remoteWidth < 1 || remoteWidth > 2) return ncclInvalidArgument;
+    activeWidth = std::min(localWidth, remoteWidth);
+    if (activeWidth == 1) {
+      INFO(NCCL_NET, "NET/IB: Force-merge activeWidth=1 fallback: localPublicWidth=%d peerPublicWidth=%d", localWidth, remoteWidth);
+    } else if (qpsPerConnection > NCCL_IB_MAX_QPS / paths / activeWidth) {
+      activeWidth = 1;
+      INFO(NCCL_NET, "NET/IB: Force-merge activeWidth=1 fallback at %d-QP limit; preserving Q=%ld and all %d standby paths",
+           NCCL_IB_MAX_QPS, qpsPerConnection, paths);
+    }
+  }
+  base->nPhysicalQps = activeWidth * qpsPerConnection * paths;
+  base->nqps = forcedAlias ? activeWidth * qpsPerConnection : base->nPhysicalQps;
+  base->nDataQps = forcedAlias ? activeWidth : paths;
+  if (base->nDataQps < 1 || base->nDataQps > base->nqps ||
+      base->nqps > base->nPhysicalQps || base->nPhysicalQps > NCCL_IB_MAX_QPS ||
+      base->nPhysicalQps % base->nqps != 0) {
+    WARN("NET/IB: Invalid QP geometry: data=%d logical=%d physical=%d",
+         base->nDataQps, base->nqps, base->nPhysicalQps);
+    return ncclInternalError;
+  }
+  const bool hasStandbyPaths = base->nPhysicalQps > base->nqps;
+  if (hasStandbyPaths != forcedAlias) {
+    WARN("NET/IB: Forced-alias mode does not match QP geometry: forcedAlias=%d logical=%d physical=%d",
+         forcedAlias, base->nqps, base->nPhysicalQps);
+    return ncclInternalError;
+  }
+  base->hasStandbyPaths = hasStandbyPaths;
+
+  for (int logicalLane = 0; logicalLane < base->nqps; logicalLane++) {
+    base->activeQps[logicalLane] = &base->qps[logicalLane];
+  }
+  if (forcedAlias) {
+    INFO(NCCL_NET, "NET/IB: Force-merge negotiated activeWidth=%d Q=%ld logicalQps=%d physicalQps=%d localPrivateDevices=%d peerPrivateDevices=%d",
+         activeWidth, qpsPerConnection, base->nqps, base->nPhysicalQps, base->vProps.ndevs, remoteDevices);
+  }
+  return ncclSuccess;
+}
+
+static int occlIbQpDeviceIndex(const ncclIbNetCommBase* base, int physicalIndex) {
+  if (!base->hasStandbyPaths) return physicalIndex % base->vProps.ndevs;
+  const int lane = physicalIndex % base->nqps;
+  const int path = physicalIndex / base->nqps;
+  // Path zero is always the lane's primary. Rotating each lane's paths retains
+  // a preconnected replacement on every private port, including the other primary.
+  return (path + lane % base->nDataQps) % base->vProps.ndevs;
+}
 
 ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base, void* cq_context, int cqSize) {
   base->ibDevN = ibDevN;
@@ -432,13 +596,14 @@ ncclResult_t ncclIbRtsQp(struct ibv_qp* qp) {
 
 ncclResult_t ncclIbListen(void* ctx, int dev, void* opaqueHandle, void** listenComm) {
   ncclResult_t ret = ncclSuccess;
+  if (dev < 0 || dev >= ncclNMergedIbDevs) return ncclInvalidArgument;
   struct ncclIbListenComm* comm;
   NCCLCHECK(ncclCalloc(&comm, 1));
   struct ncclIbHandle* handle = (struct ncclIbHandle*) opaqueHandle;
   static_assert(sizeof(struct ncclIbHandle) < NCCL_NET_HANDLE_MAXSIZE, "ncclIbHandle size too large");
   memset(handle, 0, sizeof(struct ncclIbHandle));
   comm->dev = dev;
-  handle->magic = NCCL_SOCKET_MAGIC;
+  handle->magic = ncclIbMergedDevs[dev].isForcedAlias ? occlIbForcedSocketMagic : NCCL_SOCKET_MAGIC;
   NCCLCHECKGOTO(ncclSocketInit(&comm->sock, &ncclIbIfAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1), ret, fail);
   NCCLCHECKGOTO(ncclSocketListen(&comm->sock), ret, fail);
   NCCLCHECKGOTO(ncclSocketGetAddr(&comm->sock, &handle->connectAddr), ret, fail);
@@ -462,20 +627,22 @@ fail:
 // delivered to the remote side (receiver) as part of the connection
 // establishment process.
 static ncclResult_t ncclIbSenderQpsCreate(ncclIbSendComm* comm, struct ncclIbConnectionMetadata* meta) {
-  uint nqps = comm->base.nqps;
+  const int physicalQps = occlIbCommPhysicalQpCount(&comm->base);
+  const bool hasStandbyPaths = comm->base.hasStandbyPaths;
+  assert(hasStandbyPaths == (physicalQps > comm->base.nqps));
   struct ncclIbQpCreateAttr qpCreateAttrs = {0};
   qpCreateAttrs.type = IBV_QPT_RC;
   qpCreateAttrs.accessFlags = IBV_ACCESS_REMOTE_WRITE;
   qpCreateAttrs.maxRecvWorkRequest = 0;
   // Send requests are sent using at most 2 messages (RDMA Write and RDMA Write with Immediate)
   qpCreateAttrs.maxSendWorkRequest = 2*NET_IB_MAX_REQUESTS;
-  for (int qpIndex = 0; qpIndex < nqps; qpIndex++) {
+  for (int qpIndex = 0; qpIndex < physicalQps; qpIndex++) {
     // The QPs are created in a "striped" manner across the available devices.
     // For example, if there are 2 devices and 4 QPs, the QPs will be created
     // on the devices as follows:
     // Dev0 -> QP0, QP2
     // Dev1 -> QP1, QP3
-    uint devIndex = qpIndex % comm->base.vProps.ndevs;
+    uint devIndex = occlIbQpDeviceIndex(&comm->base, qpIndex);
     ncclIbSendCommDev* commDev = &comm->devs[devIndex];
     ncclIbDev* ibDev = &ncclIbDevs[commDev->base.ibDevN];
     ncclIbQp* localQp = &comm->base.qps[qpIndex];
@@ -496,6 +663,7 @@ static ncclResult_t ncclIbSenderQpsCreate(ncclIbSendComm* comm, struct ncclIbCon
         (uint16_t)ncclParamIbPkey(),
         commDev->base.pd);
     localQp->devIndex = devIndex;
+    localQp->logicalLane = hasStandbyPaths ? qpIndex % comm->base.nqps : qpIndex;
     struct ncclIbQpColdFields* localQpCold = ncclIbCommBaseGetQpCold(&comm->base, localQp);
     localQpCold->ibPort = qpCreateAttrs.ibPort;
     localQpCold->accessFlags = qpCreateAttrs.accessFlags;
@@ -530,8 +698,8 @@ static ncclResult_t ncclIbSenderQpsCreate(ncclIbSendComm* comm, struct ncclIbCon
 // was delivered from the receiver side) on the QPs before modifying the QPs
 // to RTR.
 static ncclResult_t ncclIbSenderQpsToRts(ncclIbSendComm* comm, struct ncclIbConnectionMetadata* remMeta) {
-  uint nqps = comm->base.nqps;
-  for (int qpIndex = 0; qpIndex < nqps; qpIndex++) {
+  const int physicalQps = occlIbCommPhysicalQpCount(&comm->base);
+  for (int qpIndex = 0; qpIndex < physicalQps; qpIndex++) {
     ncclIbQp* localQp = &comm->base.qps[qpIndex];
     struct ncclIbQpColdFields* localQpCold = ncclIbCommBaseGetQpCold(&comm->base, localQp);
     ncclIbSendCommDev* commDev = &comm->devs[localQp->devIndex];
@@ -567,6 +735,10 @@ static ncclResult_t ncclIbSenderQpsToRts(ncclIbSendComm* comm, struct ncclIbConn
 
 ncclResult_t ncclIbConnect(void* ctx, int dev, void* opaqueHandle, void** sendComm, ncclNetDeviceHandle_t** /*sendDevComm*/) {
   ncclResult_t ret = ncclSuccess;
+  if (dev < 0 || dev >= ncclNMergedIbDevs) return ncclInvalidArgument;
+  struct ncclIbMergedDev* mergedDev = ncclIbMergedDevs + dev;
+  const bool forcedAlias = mergedDev->isForcedAlias;
+  int remoteWidth;
   struct ncclIbHandle* handle = (struct ncclIbHandle*) opaqueHandle;
   struct ncclIbCommStage* stage = &handle->stage;
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)stage->comm;
@@ -574,6 +746,7 @@ ncclResult_t ncclIbConnect(void* ctx, int dev, void* opaqueHandle, void** sendCo
   uint8_t link_layer = IBV_LINK_LAYER_UNSPECIFIED;
   bool useFrm = g_ncclIbUseCim;
   *sendComm = NULL;
+  NCCLCHECK(occlIbCheckPeerMode(forcedAlias, handle->magic));
 
   if (stage->state == ncclIbCommStateConnect)      goto ib_connect_check;
   if (stage->state == ncclIbCommStateSendDevList)  goto ib_send_dev_list;
@@ -586,6 +759,7 @@ ncclResult_t ncclIbConnect(void* ctx, int dev, void* opaqueHandle, void** sendCo
     return ncclInternalError;
   }
   stage->buffer = NULL;
+  stage->deviceResourcesStarted = false;
 
   NCCLCHECK(ncclIbMalloc((void**)&comm, sizeof(struct ncclIbSendComm)));
   NCCLCHECKGOTO(ncclIbSendCommInit(comm), ret, fail);
@@ -601,52 +775,43 @@ ib_connect_check:
   if (!ready) return ncclSuccess;
 
   // IB Setup
-  struct ncclIbMergedDev* mergedDev;
-  if (dev >= ncclNMergedIbDevs) {
-    WARN("NET/IB : Trying to use non-existent virtual device %d", dev);
-    return ncclInternalError;
-  }
-
-  mergedDev = ncclIbMergedDevs + dev;
   comm->base.vProps = mergedDev->vProps;
   stage->state = ncclIbCommStateSendDevList;
   stage->offset = 0;
   struct ncclIbConnectionMetadata meta;
   NCCLCHECKGOTO(ncclIbMalloc((void**)&stage->buffer, sizeof(meta)), ret, fail);
-  memcpy(stage->buffer, &mergedDev->vProps, sizeof(ncclNetVDeviceProps_t));
+  static_assert(sizeof(occlIbGeometryOffer) <= sizeof(meta), "Geometry offer exceeds connection staging buffer");
+  NCCLCHECKGOTO(occlIbPrepareDeviceList(mergedDev, stage->buffer), ret, fail);
 
 // In the case of mismatched nDevs, we will make sure that both sides of a logical connection have the same number of RC qps
 ib_send_dev_list:
-  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, stage->buffer, sizeof(ncclNetVDeviceProps_t), &stage->offset));
-  if (stage->offset != sizeof(ncclNetVDeviceProps_t)) return ncclSuccess;
+  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, stage->buffer, occlIbDeviceListSize(forcedAlias), &stage->offset), ret, fail);
+  if (stage->offset != occlIbDeviceListSize(forcedAlias)) return ncclSuccess;
 
   stage->state = ncclIbCommStateRecvDevList;
   stage->offset = 0;
 
 ib_recv_dev_list:
-  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->base.sock, stage->buffer, sizeof(ncclNetVDeviceProps_t), &stage->offset));
-  if (stage->offset != sizeof(ncclNetVDeviceProps_t)) return ncclSuccess;
+  NCCLCHECKGOTO(occlIbReceiveDeviceList(&comm->base.sock, forcedAlias, stage->buffer, &stage->offset), ret, fail);
+  if (stage->offset != occlIbDeviceListSize(forcedAlias)) return ncclSuccess;
   stage->offset = 0;
   ncclNetVDeviceProps_t remoteVProps;
   ncclNetCommConfig_t* config;
-  memcpy(&remoteVProps, stage->buffer, sizeof(ncclNetVDeviceProps_t));
+  NCCLCHECKGOTO(occlIbParseDeviceList(forcedAlias, stage->buffer, &remoteVProps, &remoteWidth), ret, fail);
   mergedDev = ncclIbMergedDevs + dev;
   comm->base.vProps = mergedDev->vProps;
-  int localNqps, remoteNqps;
-  localNqps  = ncclParamIbQpsPerConn() * comm->base.vProps.ndevs; // We must have at least 1 qp per-device
-  remoteNqps = ncclParamIbQpsPerConn() * remoteVProps.ndevs;
-  comm->base.nqps = remoteNqps > localNqps ? remoteNqps : localNqps; // Select max nqps (local or remote)
+  NCCLCHECKGOTO(occlIbConfigureQpGeometry(&comm->base, forcedAlias, remoteVProps.ndevs,
+                                        std::min(mergedDev->publicVProps.ndevs, 2), remoteWidth), ret, fail);
   if (useFrm) {
     NCCLCHECKGOTO(ncclIbSendCommInitMultiSendScratch(comm), ret, fail);
   }
-
-  comm->base.nDataQps = std::max(comm->base.vProps.ndevs, remoteVProps.ndevs);
 
   if (comm->base.resiliency) {
     NCCLCHECK(ncclIbResiliencyDeviceNumSet(comm->base.resiliency, comm->base.vProps.ndevs, remoteVProps.ndevs));
   }
 
   // Init PD, Ctx for each IB device
+  stage->deviceResourcesStarted = true;
   comm->ar = 1; // Set to 1 for logic
   // Sender's CQ size needs to accomodate the upper bound of number of send
   // requests multiplied by the number of QPs used per request.
@@ -695,7 +860,7 @@ ib_recv_dev_list:
     devInfo->gid.global.interface_id = commDev->base.gidInfo.localGid.global.interface_id;
 
     // info logging
-    for (int q = 0; q < comm->base.nqps; q++) {
+    for (int q = 0; q < occlIbCommPhysicalQpCount(&comm->base); q++) {
       // Print just the QPs for this dev
       if (comm->base.qps[q].devIndex == i) {
         if (devInfo->link_layer == IBV_LINK_LAYER_INFINIBAND) { // IB
@@ -799,11 +964,13 @@ ib_connect:
     comm->cim = CIM_Start(comm->base.nqps);
     if (comm->cim != NULL) {
       comm->cim->spread_eps_us = ibFrmResolveSpreadEpsUs(comm);
-      for (int q = 0; q < comm->base.nqps; q++) {
+      for (int q = 0; q < occlIbCommPhysicalQpCount(&comm->base); q++) {
         comm->base.qps[q].sig_head = 0;
         comm->base.qps[q].sig_tail = 0;
         memset(comm->base.qps[q].sig_tsc, 0, sizeof(comm->base.qps[q].sig_tsc));
         memset(comm->base.qps[q].sig_bytes, 0, sizeof(comm->base.qps[q].sig_bytes));
+      }
+      for (int q = 0; q < comm->base.nqps; q++) {
         comm->base.frmFields.send.qp_lat[q] = 0;
         comm->base.frmCold.qp_raw_lat[q] = 0;
         comm->base.frmCold.qp_lat_bytes[q] = 0;
@@ -828,10 +995,15 @@ ib_send_ready:
   *sendComm = comm;
 exit:
   if (stage->buffer) free(stage->buffer);
+  stage->buffer = NULL;
   stage->state = ncclIbCommStateStart;
   return ret;
 fail:
   if (comm != NULL) {
+    if (!stage->deviceResourcesStarted) {
+      if (stage->state != ncclIbCommStateStart) (void)ncclSocketClose(&comm->base.sock);
+      (void)ncclIbResiliencyDestroy(&comm->base.resiliency);
+    }
     CIM_DebugLatPrinterSetWeightSource("lw", NULL, 0);
     CIM_DebugLatPrinterSetSource("qp_lat", NULL, NULL, 0);
     CIM_DebugLatPrinterSetByteSource("bytes", NULL, 0);
@@ -844,6 +1016,7 @@ fail:
     ncclIbSendCommFreeMultiSendScratch(comm);
   }
   free(comm);
+  stage->comm = NULL;
   goto exit;
 }
 
@@ -897,7 +1070,9 @@ ncclResult_t ncclIbCheckVProps(ncclNetVDeviceProps_t* vProps1, ncclNetVDevicePro
 // QPs' information so that data structure could be delivered to the remote
 // side (sender) as part of the connection establishment process.
 static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct ncclIbConnectionMetadata* remMeta, struct ncclIbConnectionMetadata* meta) {
-  uint nqps = rComm->base.nqps;
+  const int physicalQps = occlIbCommPhysicalQpCount(&rComm->base);
+  const bool hasStandbyPaths = rComm->base.hasStandbyPaths;
+  assert(hasStandbyPaths == (physicalQps > rComm->base.nqps));
   struct ncclIbQpCreateAttr qpCreateAttrs = {0};
   qpCreateAttrs.type = IBV_QPT_RC;
   // Remote Atomic operations are used for GIN!
@@ -909,13 +1084,13 @@ static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
   // When resiliency is enabled, the number of send work requests is as the
   // number of max requests because every CTS message is signaled.
   qpCreateAttrs.maxSendWorkRequest = NET_IB_MAX_REQUESTS * (rComm->base.resiliency ? 1 : 2);
-  for (int qpIndex = 0; qpIndex < nqps; qpIndex++) {
+  for (int qpIndex = 0; qpIndex < physicalQps; qpIndex++) {
     // The QPs are created in a "striped" manner across the available devices.
     // For example, if there are 2 devices and 4 QPs, the QPs will be created
     // on the devices as follows:
     // Dev0 -> QP0, QP2
     // Dev1 -> QP1, QP3
-    uint devIndex = qpIndex % rComm->base.vProps.ndevs;
+    uint devIndex = occlIbQpDeviceIndex(&rComm->base, qpIndex);
     ncclIbRecvCommDev* rCommDev = &rComm->devs[devIndex];
     ncclIbDev* ibDev = &ncclIbDevs[rCommDev->base.ibDevN];
     ncclIbQpInfo* remQpInfo = &remMeta->qpInfo[qpIndex];
@@ -934,6 +1109,7 @@ static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
     NCCLCHECK(ncclIbCreateQp(&qpCreateAttrs, &rComm->base.stats, localQp));
     localQp->remDevIdx = remDevIndex;
     localQp->devIndex = devIndex;
+    localQp->logicalLane = hasStandbyPaths ? qpIndex % rComm->base.nqps : qpIndex;
     localQpCold->remQpn = remQpInfo->qpn;
     localQpCold->remEceSupported = remQpInfo->ece_supported;
     localQpCold->ibPort = qpCreateAttrs.ibPort;
@@ -1021,13 +1197,13 @@ static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
 
 ncclResult_t ncclIbReceiverPrePostReceiveWorkRequests(struct ncclIbRecvComm* recvComm) {
   uint32_t nRecvWorkRequestsPerQp = NET_IB_MAX_REQUESTS;
-  int nqps = recvComm->base.nqps;
-  for (int i = 0; i < nqps; i++) {
+  const int physicalQps = occlIbCommPhysicalQpCount(&recvComm->base);
+  for (int i = 0; i < physicalQps; i++) {
     struct ncclIbQp* dataQp = &recvComm->base.qps[i];
     if (recvComm->base.resiliency) {
       ncclIbResiliencyDataRqSizeGet(recvComm->base.resiliency, dataQp->devIndex, &nRecvWorkRequestsPerQp);
     }
-    INFO(NCCL_NET, "NET/IB: %s: Pre-posting %d Receive WQEs on QP %d (qp_num=%d, comm=%p) (out of total %d QPs)", __func__, nRecvWorkRequestsPerQp, i, dataQp->qp->qp_num, recvComm, nqps);
+    INFO(NCCL_NET, "NET/IB: %s: Pre-posting %d Receive WQEs on QP %d (qp_num=%d, comm=%p) (out of total %d QPs)", __func__, nRecvWorkRequestsPerQp, i, dataQp->qp->qp_num, recvComm, physicalQps);
     for (int j = 0; j < nRecvWorkRequestsPerQp; j++) {
       NCCLCHECK(ncclIbPostRecvWorkRequest(dataQp->qp, &recvComm->ibRecvWorkRequest));
     }
@@ -1040,6 +1216,10 @@ NCCL_PARAM(IbGdrFlushDisable, "GDR_FLUSH_DISABLE", 0);
 ncclResult_t ncclIbAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle_t** /*recvDevComm*/) {
   ncclResult_t ret = ncclSuccess;
   struct ncclIbListenComm* lComm = (struct ncclIbListenComm*)listenComm;
+  if (lComm->dev < 0 || lComm->dev >= ncclNMergedIbDevs) return ncclInvalidArgument;
+  struct ncclIbMergedDev* mergedDev = ncclIbMergedDevs + lComm->dev;
+  const bool forcedAlias = mergedDev->isForcedAlias;
+  int remoteWidth;
   struct ncclIbCommStage* stage = lComm->stage;
   if (stage == NULL) {
     NCCLCHECK(ncclCalloc(&lComm->stage, 1));
@@ -1072,7 +1252,7 @@ ncclResult_t ncclIbAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle
   // Alloc stage->buffer here to be used for all following steps
   struct ncclIbConnectionMetadata remMeta;
   stage->offset = 0;
-  NCCLCHECK(ncclIbMalloc((void**)&stage->buffer, sizeof(remMeta)));
+  NCCLCHECKGOTO(ncclIbMalloc((void**)&stage->buffer, sizeof(remMeta)), ret, fail);
 
 ib_accept_check:
   NCCLCHECKGOTO(ncclSocketReady(&rComm->base.sock, &ready), ret, fail);
@@ -1082,27 +1262,17 @@ ib_accept_check:
 
 // In the case of mismatched nDevs, we will make sure that both sides of a logical connection have the same number of RC qps
 ib_recv_dev_list:
-  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &rComm->base.sock, stage->buffer, sizeof(ncclNetVDeviceProps_t), &stage->offset));
-  if (stage->offset != sizeof(ncclNetVDeviceProps_t)) return ncclSuccess;
+  NCCLCHECKGOTO(occlIbReceiveDeviceList(&rComm->base.sock, forcedAlias, stage->buffer, &stage->offset), ret, fail);
+  if (stage->offset != occlIbDeviceListSize(forcedAlias)) return ncclSuccess;
   ncclNetVDeviceProps_t remoteVProps;
-  memcpy(&remoteVProps, stage->buffer, sizeof(ncclNetVDeviceProps_t));
-  if (lComm->dev >= ncclNMergedIbDevs) {
-    WARN("NET/IB : Trying to use non-existent virtual device %d", lComm->dev);
-    return ncclInternalError;
-  }
+  NCCLCHECKGOTO(occlIbParseDeviceList(forcedAlias, stage->buffer, &remoteVProps, &remoteWidth), ret, fail);
 
   // Reduce the physical device list and store in the connection base
-  struct ncclIbMergedDev* mergedDev;
-  mergedDev = ncclIbMergedDevs + lComm->dev;
-  NCCLCHECK(ncclIbCheckVProps(&mergedDev->vProps, &remoteVProps));
+  NCCLCHECKGOTO(ncclIbCheckVProps(&mergedDev->vProps, &remoteVProps), ret, fail);
   rComm->base.vProps = mergedDev->vProps;
-  memcpy(stage->buffer, &rComm->base.vProps, sizeof(ncclNetVDeviceProps_t));
-  int localNqps, remoteNqps;
-  localNqps  = ncclParamIbQpsPerConn() * rComm->base.vProps.ndevs; // We must have at least 1 qp per-device
-  remoteNqps = ncclParamIbQpsPerConn() * remoteVProps.ndevs;
-  rComm->base.nqps = remoteNqps > localNqps ? remoteNqps : localNqps; // Select max nqps (local or remote)
-
-  rComm->base.nDataQps = std::max(rComm->base.vProps.ndevs, remoteVProps.ndevs);
+  NCCLCHECKGOTO(occlIbConfigureQpGeometry(&rComm->base, forcedAlias, remoteVProps.ndevs,
+                                        std::min(mergedDev->publicVProps.ndevs, 2), remoteWidth), ret, fail);
+  NCCLCHECKGOTO(occlIbPrepareDeviceList(mergedDev, stage->buffer), ret, fail);
 
   if (rComm->base.resiliency) {
     NCCLCHECK(ncclIbResiliencyDeviceNumSet(rComm->base.resiliency, rComm->base.vProps.ndevs, remoteVProps.ndevs));
@@ -1112,8 +1282,8 @@ ib_recv_dev_list:
   stage->state = ncclIbCommStateSendDevList;
 
 ib_send_dev_list:
-  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, &rComm->base.sock, stage->buffer, sizeof(ncclNetVDeviceProps_t), &stage->offset), ret, fail);
-  if (stage->offset != sizeof(ncclNetVDeviceProps_t)) return ncclSuccess;
+  NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, &rComm->base.sock, stage->buffer, occlIbDeviceListSize(forcedAlias), &stage->offset), ret, fail);
+  if (stage->offset != occlIbDeviceListSize(forcedAlias)) return ncclSuccess;
 
   stage->offset = 0;
   stage->state = ncclIbCommStateRecv;
@@ -1146,6 +1316,7 @@ ib_recv:
   // of a receive request) per QP, in the worst case.
   int cqSize;
   cqSize = 2*NET_IB_MAX_REQUESTS*ncclParamIbQpsPerConn();
+  stage->deviceResourcesStarted = true;
   for (int i = 0; i < rComm->base.vProps.ndevs; i++) {
     rCommDev = rComm->devs + i;
     ibDevN = rComm->base.vProps.devs[i];
@@ -1191,7 +1362,7 @@ ib_recv:
 
   // Determine if Flush is enabled for this Comm. Must be done before creating
   // QPs. If Flush is enabled, extra QPs will be created for Flush operations.
-  rComm->flushEnabled = ((ncclIbGdrSupport() == ncclSuccess || ncclIbDmaBufSupport(lComm->dev) == ncclSuccess)
+  rComm->flushEnabled = ((ncclIbGdrSupport() == ncclSuccess || ncclIbDmaBufSupport(mergedDev->anchorDev) == ncclSuccess)
                             && (ncclParamIbGdrFlushDisable() == 0)) ? 1 : 0;
 
   NCCLCHECKGOTO(ncclIbReceiverQpsCreateToRts(rComm, &remMeta, &meta), ret, fail);
@@ -1278,6 +1449,10 @@ exit:
   lComm->stage = NULL;
   return ret;
 fail:
+  if (rComm != NULL && !stage->deviceResourcesStarted) {
+    if (stage->state != ncclIbCommStateStart) (void)ncclSocketClose(&rComm->base.sock);
+    (void)ncclIbResiliencyDestroy(&rComm->base.resiliency);
+  }
   free(rComm);
   goto exit;
 }
@@ -1287,7 +1462,7 @@ ncclResult_t ncclIbCloseSend(void* sendComm) {
   if (comm) {
     NCCLCHECK(ncclSocketClose(&comm->base.sock));
 
-    for (int q = 0; q < comm->base.nqps; q++)
+    for (int q = 0; q < occlIbCommPhysicalQpCount(&comm->base); q++)
       if (comm->base.qps[q].qp != NULL) NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
 
     if (comm->base.resiliency) {
@@ -1329,7 +1504,7 @@ ncclResult_t ncclIbCloseRecv(void* recvComm) {
   if (comm) {
     NCCLCHECK(ncclSocketClose(&comm->base.sock));
 
-    for (int q = 0; q < comm->base.nqps; q++)
+    for (int q = 0; q < occlIbCommPhysicalQpCount(&comm->base); q++)
       if (comm->base.qps[q].qp != NULL) NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
 
     if (comm->base.resiliency) {

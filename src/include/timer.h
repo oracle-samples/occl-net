@@ -1,7 +1,7 @@
 /*************************************************************************
  * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
  *
- * See LICENSE.txt for license information
+ * See third_party/licenses/Apache-2.0.txt for license information
  ************************************************************************/
 
 #ifndef NCCL_TIMER_H_

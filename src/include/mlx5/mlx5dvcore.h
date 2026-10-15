@@ -30,7 +30,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0 and BSD-3
  *
- * See LICENSE.txt for more license information
+ * See third_party/licenses/NCCL-LICENSE.txt for more license information
  *************************************************************************/
 
 #ifndef NCCL_MLX5DV_CORE_H_
